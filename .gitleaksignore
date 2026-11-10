@@ -1,3 +1,4 @@
 # Gitleaks ignore list for false positives
 # Fingerprint for markdown documentation schema payload example
 db3060436a9766a1e51444aac25a5be5018021d0:docs/02-api-specifications.md:generic-api-key:82
+
