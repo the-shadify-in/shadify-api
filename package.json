@@ -1,0 +1,42 @@
+{
+  "name": "shadify-api",
+  "version": "1.0.0",
+  "description": "Shadify Core Backend Service and Asynchronous Worker Runtime",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "worker": "tsx src/worker/runtime.ts",
+    "prisma:generate": "prisma generate",
+    "test": "vitest run",
+    "lint:lockfile": "lockfile-lint --path package-lock.json --allowed-hosts npm --validate-https --validate-package-names --allowed-package-versions fastify:5.2.1"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.758.0",
+    "@aws-sdk/s3-request-presigner": "3.758.0",
+    "@fastify/cors": "10.0.2",
+    "@fastify/rate-limit": "10.2.2",
+    "@fastify/sensible": "6.0.3",
+    "@prisma/client": "6.4.1",
+    "dotenv": "16.4.7",
+    "fastify": "5.2.1",
+    "pg": "8.13.3",
+    "sharp": "0.33.5",
+    "zod": "3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.9",
+    "@types/pg": "8.11.11",
+    "lockfile-lint": "4.14.0",
+    "prisma": "6.4.1",
+    "tsx": "4.19.3",
+    "typescript": "5.8.2",
+    "vitest": "3.0.7"
+  }
+}
+
