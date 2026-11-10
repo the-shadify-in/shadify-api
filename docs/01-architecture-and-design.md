@@ -1,6 +1,6 @@
 # 01 — `shadify-api` Architecture & Design
 
-**Stack:** Fastify 5.2.1, Node.js 22.14.0 Jod LTS, TypeScript 5.8+, Prisma 6.4.1  
+**Stack:** Fastify 5.2.1, Node.js 24 (`>=24.0.0 <25`), TypeScript 5.8+, Prisma 6.4.1  
 **Runtime Environment:** Google Cloud Run (Regional: `asia-south1`)  
 **Database:** Cloud SQL PostgreSQL 16 Enterprise (via Direct VPC Egress)
 
@@ -36,7 +36,7 @@ flowchart TD
 
 ## 3. Deployment Configuration (Google Cloud Run)
 
-- **Container Image**: Built with Node.js 22-slim base image, multi-stage compilation (`tsc`), running non-root `node` user.
+- **Container Image**: Built with Node.js 24-slim base image, multi-stage compilation (`tsc`), running non-root `node` user.
 - **Ingress Setting**: `--ingress=internal-and-cloud-load-balancing` (blocks raw internet access, routing strictly through GCP ALB Serverless NEGs).
 - **VPC Connector**: Direct VPC Egress configured to route database traffic directly to private Cloud SQL IP (`10.x.x.x`).
 - **Concurrency**: Fastify API container: concurrency = 80; Worker runtime container: concurrency = 5 (CPU-bound image transform limits).

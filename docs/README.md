@@ -8,7 +8,7 @@ Welcome to the internal engineering documentation for **`shadify-api`**, the cor
 
 | Document | Description |
 | :--- | :--- |
-| [`01-architecture-and-design.md`](./01-architecture-and-design.md) | Fastify 5 architecture, Node 22 Jod LTS runtime, Cloud Run deployment. |
+| [`01-architecture-and-design.md`](./01-architecture-and-design.md) | Fastify 5 architecture, Node.js 24 runtime (`>=24.0.0 <25`), Cloud Run deployment. |
 | [`02-api-specifications.md`](./02-api-specifications.md) | Endpoints: `/v1/uploads/*`, `/internal-bff/*`, and `/health`. |
 | [`03-worker-runtime-and-transforms.md`](./03-worker-runtime-and-transforms.md) | Asynchronous outbox worker, Worker Threads, Sharp transforms, 10s shutdown budget. |
 | [`04-database-and-procedures.md`](./04-database-and-procedures.md) | Quota stored procedures, lease fencing, DLQ HMAC replay cryptosystem. |
@@ -20,7 +20,7 @@ Welcome to the internal engineering documentation for **`shadify-api`**, the cor
 ## 2. Quickstart & Local Development
 
 ### Prerequisites
-- Node.js `>=22.14.0` (Jod LTS line)
+- Node.js `>=24.0.0 <25` (verified on `v24.22.2`)
 - PostgreSQL 16 (local or Cloud SQL proxy)
 
 ### Commands
