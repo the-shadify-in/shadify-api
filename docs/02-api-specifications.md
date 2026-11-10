@@ -79,7 +79,7 @@
   {
     "dlqId": "501",
     "operatorUserId": "e0b8e75b-4390-4828-a5b6-76495b290947",
-    "operatorSecretHex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    "operatorSecretHex": "<64_CHARACTER_OPERATOR_SECRET_HEX>"
   }
   ```
 - **Response**: `200 OK` `{ "status": "SUCCESS", "replayedOutboxId": "2001", "newGeneration": "2" }`
