@@ -4078,48 +4078,206 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }).toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'users' forbidden/);
     });
 
-    it('F14.5-B Malformed Acquired Client Resource-Leak Prevention: proves malformed connection is released and not leaked when missing query interface', async () => {
-      const mockMalformedClient = {
+    it('F14.5-B Malformed Acquired Client Resource-Leak Prevention: proves malformed connection is discarded with error release or destroy', async () => {
+      // Case 1: Malformed client with only release() -> invoked with MALFORMED_CONNECTION_CLIENT_DISCARD error to force pool disposal
+      const mockMalformedClient1 = {
         release: vi.fn(),
         // missing query() interface!
       };
-      const mockPool = {
-        connect: async () => mockMalformedClient,
+      const mockPool1 = {
+        connect: async () => mockMalformedClient1,
         query: vi.fn(),
       };
-      const adapter = new ProductionDatabaseBoundaryPoolAdapter(mockPool, () => {});
+      const adapter1 = new ProductionDatabaseBoundaryPoolAdapter(mockPool1, () => {});
 
-      await expect(adapter.connect()).rejects.toThrow(
+      await expect(adapter1.connect()).rejects.toThrow(
         /CRITICAL_BOUNDARY_ERROR: Acquired connection client does not implement query\(\) interface/
       );
+      expect(mockMalformedClient1.release).toHaveBeenCalledTimes(1);
+      expect(mockMalformedClient1.release).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'MALFORMED_CONNECTION_CLIENT_DISCARD' })
+      );
 
-      // Crucial assertion: the malformed client's release method was invoked so pool resources are not leaked!
-      expect(mockMalformedClient.release).toHaveBeenCalledTimes(1);
+      // Case 2: Malformed client with destroy() -> destroy() is preferred and invoked
+      const mockMalformedClient2 = {
+        release: vi.fn(),
+        destroy: vi.fn(),
+        // missing query() interface!
+      };
+      const mockPool2 = {
+        connect: async () => mockMalformedClient2,
+        query: vi.fn(),
+      };
+      const adapter2 = new ProductionDatabaseBoundaryPoolAdapter(mockPool2, () => {});
+
+      await expect(adapter2.connect()).rejects.toThrow(
+        /CRITICAL_BOUNDARY_ERROR: Acquired connection client does not implement query\(\) interface/
+      );
+      expect(mockMalformedClient2.destroy).toHaveBeenCalledTimes(1);
+      expect(mockMalformedClient2.release).not.toHaveBeenCalled();
     });
 
-    it('F14.5-B Connection Reuse & Unconditional Re-initialization: proves reacquired physical client is unconditionally sanitized if tainted between checkouts', async () => {
+    it('F14.5-B Connection Reuse & Unconditional Re-initialization: proves reacquired physical client is unconditionally sanitized if tainted between checkouts, and proves same physical PID was reused', async () => {
       const pool = new pg.Pool({ ...localDbConfig, max: 1 });
       const adapter = new ProductionDatabaseBoundaryPoolAdapter(pool, () => {});
 
       try {
-        // 1. Initial checkout through adapter: session is pinned to public, pg_temp
+        // 1. Initial checkout through adapter: session is pinned to public, pg_temp, record physical backend PID
         const client1 = await adapter.connect();
-        const check1 = await client1.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
+        const check1 = await client1.query("SELECT current_setting('search_path') AS path, pg_backend_pid() AS pid FROM outbox_events LIMIT 1");
         expect(check1.rows[0].path).toBe('public, pg_temp');
+        const pid1 = check1.rows[0].pid;
+        expect(typeof pid1).toBe('number');
         await client1.release(); // Releases physical client back to pool
 
         // 2. Simulate another code path acquiring the physical connection directly from raw pool and mutating session:
         const rawClient = await pool.connect();
         await rawClient.query('SET search_path = pg_catalog, pg_temp');
-        const taintedSetting = await rawClient.query("SELECT current_setting('search_path') AS path");
+        const taintedSetting = await rawClient.query("SELECT current_setting('search_path') AS path, pg_backend_pid() AS pid");
         expect(taintedSetting.rows[0].path).toBe('pg_catalog, pg_temp');
+        expect(taintedSetting.rows[0].pid).toBe(pid1); // Same physical connection
         rawClient.release(); // Releases tainted physical client back to pool
 
         // 3. Adapter reacquires connection from pool: unconditionally executes 'SET search_path = public, pg_temp'
         const client2 = await adapter.connect();
-        const check2 = await client2.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
+        const check2 = await client2.query("SELECT current_setting('search_path') AS path, pg_backend_pid() AS pid FROM outbox_events LIMIT 1");
         expect(check2.rows[0].path).toBe('public, pg_temp'); // Fully restored & sanitized!
+        const pid2 = check2.rows[0].pid;
+        expect(pid2).toBe(pid1); // Definitive proof: EXACT SAME physical connection was reused and sanitized!
         await client2.release();
+      } catch (err: any) {
+        if (err.code === 'ECONNREFUSED' || err.code === 'EPERM') {
+          throw new Error(
+            `CRITICAL_RELEASE_GATE_VERIFICATION_FAILURE: Live PostgreSQL on port 5433 required for F14.5-B verification is unavailable: ${err.message}`
+          );
+        }
+        throw err;
+      } finally {
+        await pool.end().catch(() => {});
+      }
+    });
+
+    it('F14.5-B Strict PostgreSQL Lexical Grammar & Boundary Enforcement Suite: proves 12 PostgreSQL lexical rules against live PostgreSQL on port 5433', async () => {
+      const pool = new pg.Pool(localDbConfig);
+
+      try {
+        const rawPg = await pool.connect();
+
+        try {
+          // Verify PostgreSQL runtime standard_conforming_strings setting is ON:
+          const scsRes = await rawPg.query("SHOW standard_conforming_strings");
+          expect(scsRes.rows[0].standard_conforming_strings).toBe('on');
+
+          // Rule 1: Ordinary string with \ and ' under standard_conforming_strings = on:
+          // In PostgreSQL, \ is literal. So 'abc\' has a literal \ and the ' closes the string!
+          // Real PostgreSQL evaluates: SELECT 'abc\' || 'def' AS val -> evaluates 'abc\' concatenated with 'def' -> returns 'abc\def'.
+          const pgOrdRes = await rawPg.query("SELECT 'abc\\' || 'def' AS val");
+          expect(pgOrdRes.rows[0].val).toBe('abc\\def');
+
+          // If someone submits "SELECT 'abc\'; DROP TABLE users;", PostgreSQL parses 'abc\' as string literal, followed by ';' statement boundary!
+          // Our splitSqlStatements must detect ';' as statement boundary outside 'abc\'!
+          const injectionSql = "SELECT 'abc\\'; DROP TABLE users;";
+          const splitStmts = splitSqlStatements(injectionSql);
+          expect(splitStmts).toHaveLength(2);
+          expect(() => assertProductionSqlPolicy(injectionSql)).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Multiple SQL statements forbidden through boundary/
+          );
+
+          // Rule 2: C-style escape string E'...' allows \' to escape quote:
+          const pgEscRes = await rawPg.query("SELECT E'hello\\'world' AS val");
+          expect(pgEscRes.rows[0].val).toBe("hello'world");
+          // Tokenizer and statement splitter preserve E'hello\'world' without treating \' as statement termination:
+          const escSql = "SELECT E'hello\\'world;' FROM outbox_events WHERE status = $1";
+          expect(splitSqlStatements(escSql)).toHaveLength(1);
+          expect(tokenizeAndStripSqlComments(escSql)).toContain("E'hello\\'world;'");
+
+          // Rule 3: Doubled single quotes '' in both ordinary and escape strings:
+          const pgDoubledRes = await rawPg.query("SELECT 'it''s an outbox' AS val");
+          expect(pgDoubledRes.rows[0].val).toBe("it's an outbox");
+          const doubledQuoteSql = "SELECT 'it''s an outbox; not a stmt' FROM outbox_events WHERE status = $1";
+          expect(splitSqlStatements(doubledQuoteSql)).toHaveLength(1);
+
+          // Rule 4: Doubled double quotes "" inside quoted identifiers:
+          const pgIdentRes = await rawPg.query('SELECT 1 AS "col""name"');
+          expect(pgIdentRes.rows[0]['col"name']).toBe(1);
+          const doubledIdentSql = 'SELECT "col""name;not_stmt" FROM outbox_events WHERE status = $1';
+          expect(splitSqlStatements(doubledIdentSql)).toHaveLength(1);
+
+          // Rule 5: Valid tagged ($tag$...$tag$) and untagged ($$...$$) dollar quotes:
+          const pgDollarRes = await rawPg.query("SELECT $$untagged; /* comment */$$ AS v1, $my_tag$tagged; -- note$my_tag$ AS v2");
+          expect(pgDollarRes.rows[0].v1).toBe("untagged; /* comment */");
+          expect(pgDollarRes.rows[0].v2).toBe("tagged; -- note");
+          const dollarSql = "SELECT $$untagged; /* comment */$$, $my_tag$tagged; -- note$my_tag$ FROM outbox_events WHERE status = $1";
+          expect(splitSqlStatements(dollarSql)).toHaveLength(1);
+          expect(tokenizeAndStripSqlComments(dollarSql)).toContain("$$untagged; /* comment */$$");
+          expect(tokenizeAndStripSqlComments(dollarSql)).toContain("$my_tag$tagged; -- note$my_tag$");
+
+          // Rule 6: Invalid digit-leading dollar tags ($123$...$123$) are NOT treated as dollar quote tags:
+          // In PostgreSQL, tags follow unquoted identifier grammar (cannot start with digit).
+          // $123$ is treated as positional parameter/token $123 followed by $.
+          // If followed by semicolon, splitSqlStatements splits on semicolon:
+          const digitDollarSql = "SELECT $123; DROP TABLE users;";
+          expect(splitSqlStatements(digitDollarSql)).toHaveLength(2);
+
+          // Rule 7: Unterminated single-quoted strings fail closed:
+          expect(() => tokenizeAndStripSqlComments("SELECT 'unterminated single quote")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated single-quoted string in SQL statement/
+          );
+          expect(() => splitSqlStatements("SELECT 'unterminated single quote")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated single-quoted string in SQL statement/
+          );
+          expect(() => tokenizeAndStripSqlComments("SELECT E'unterminated escape string with trailing backslash\\")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated single-quoted string in SQL statement/
+          );
+
+          // Rule 8: Unterminated double-quoted identifiers fail closed:
+          expect(() => tokenizeAndStripSqlComments('SELECT "unterminated ident')).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated double-quoted identifier in SQL statement/
+          );
+          expect(() => splitSqlStatements('SELECT "unterminated ident')).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated double-quoted identifier in SQL statement/
+          );
+
+          // Rule 9: Unterminated dollar-quoted strings fail closed:
+          expect(() => tokenizeAndStripSqlComments("SELECT $$unterminated dollar")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated dollar-quoted string in SQL statement/
+          );
+          expect(() => tokenizeAndStripSqlComments("SELECT $tag$unterminated tagged dollar")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated dollar-quoted string in SQL statement/
+          );
+          expect(() => splitSqlStatements("SELECT $$unterminated dollar")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated dollar-quoted string in SQL statement/
+          );
+
+          // Rule 10: Unterminated nested block comments fail closed:
+          expect(() => tokenizeAndStripSqlComments("SELECT /* outer /* inner */ unclosed")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated block comment in SQL statement/
+          );
+          expect(() => splitSqlStatements("SELECT /* outer /* inner */ unclosed")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated block comment in SQL statement/
+          );
+
+          // Rule 11: Multiple statements separated by semicolons outside literals fail closed:
+          expect(splitSqlStatements("SELECT 1; SELECT 2")).toHaveLength(2);
+          expect(() => assertProductionSqlPolicy("SELECT 1; SELECT 2")).toThrow(
+            /CRITICAL_BOUNDARY_ERROR: Multiple SQL statements forbidden through boundary/
+          );
+
+          // Rule 12: Semicolons inside EVERY supported literal type do NOT split statements:
+          const multiLiteralSql = "SELECT 'str;1', E'esc;\\;2', \"col;3\", $$dollar;4$$, $tag$tag;5$tag$ /* comment;6 */ -- line;7\nFROM outbox_events WHERE status = $1";
+          const singleStmts = splitSqlStatements(multiLiteralSql);
+          expect(singleStmts).toHaveLength(1);
+          const tokenized = tokenizeAndStripSqlComments(multiLiteralSql);
+          expect(tokenized).toContain("'str;1'");
+          expect(tokenized).toContain("E'esc;\\;2'");
+          expect(tokenized).toContain('"col;3"');
+          expect(tokenized).toContain('$$dollar;4$$');
+          expect(tokenized).toContain('$tag$tag;5$tag$');
+          expect(tokenized).not.toContain('comment;6');
+          expect(tokenized).not.toContain('line;7');
+        } finally {
+          rawPg.release();
+        }
       } catch (err: any) {
         if (err.code === 'ECONNREFUSED' || err.code === 'EPERM') {
           throw new Error(

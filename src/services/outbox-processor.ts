@@ -342,14 +342,28 @@ const HARNESS_TEST_SQL_TEMPLATES: ReadonlyArray<{
     description: 'Schema OID and Resolution Verification Probe',
     pattern: /^SELECT\s+relnamespace::regnamespace::text\s+AS\s+resolved_schema,\s*oid\s+AS\s+resolved_oid\s+FROM\s+pg_class\s+WHERE\s+oid\s*=\s*'outbox_events'::regclass::oid$/i,
   }),
+  Object.freeze({
+    id: 'T-BACKEND-PID-CHECK',
+    description: 'Physical Connection Identity & Backend PID Verification Probe',
+    pattern: /^SELECT\s+(?:current_setting\('search_path'\)\s+AS\s+\w+,\s*)?pg_backend_pid\(\)\s+AS\s+pid\s+FROM\s+(?:public\.)?outbox_events(?:\s+LIMIT\s+\d+)?$/i,
+  }),
 ]);
 
 /**
- * PostgreSQL-Aware SQL Comment Stripper & Token Normalizer (F14.5 Revision 20.8).
+ * PostgreSQL-Aware SQL Comment Stripper & Token Normalizer (F14.5 Revision 20.9).
  * Safely strips comments (-- line comments and /* ... *\/ block comments, including nested block comments)
  * ONLY when they occur outside of string literals, dollar-quoted blocks, and quoted identifiers.
- * Guarantees that '--', '/*', and ';' inside literals or identifiers are preserved verbatim and
- * never misclassified as comments or statement boundaries.
+ *
+ * Implements strict PostgreSQL lexical rules under standard_conforming_strings = on:
+ * - Ordinary single-quoted strings ('...'): backslash '\' is a literal character, NOT an escape character.
+ *   Only doubled single quotes ('''') escape a quote.
+ * - C-style escape strings (E'...' or e'...'): backslash '\' escapes the next character (e.g. \', \\).
+ * - Quoted identifiers ("..."): only doubled double-quotes ("""") escape a quote.
+ * - Dollar-quoted strings ($tag$...$tag$ or $$...$$): delimiter tags match ^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$
+ *   Tags cannot begin with a digit (e.g. $123$ is treated as parameter/tokens, not a dollar quote).
+ * - Block comments (/* ... *\/): supports arbitrary nested block comments.
+ * - Fail-closed: Unterminated strings, identifiers, dollar quotes, or block comments immediately throw
+ *   CRITICAL_BOUNDARY_ERROR.
  */
 export function tokenizeAndStripSqlComments(sql: string): string {
   let result = '';
@@ -360,28 +374,45 @@ export function tokenizeAndStripSqlComments(sql: string): string {
     const ch = sql[i];
     const next = i + 1 < len ? sql[i + 1] : '';
 
-    // 1. Single-quoted string literal: '...'
-    if (ch === "'") {
-      result += ch;
+    // 1. Single-quoted string literal: ordinary ('...') or C-style escape (E'...' / e'...')
+    const isEscapePrefix = (ch === 'E' || ch === 'e') && next === "'" && (i === 0 || !/[a-zA-Z0-9_"]/.test(sql[i - 1]));
+    if (isEscapePrefix || ch === "'") {
+      const isEscapeString = isEscapePrefix;
+      if (isEscapePrefix) {
+        result += ch;
+        i++;
+      }
+      result += sql[i]; // append opening quote
       i++;
+      let terminated = false;
       while (i < len) {
         const c = sql[i];
-        result += c;
-        if (c === "'") {
-          // Check for escaped quote ''
+        if (isEscapeString && c === '\\') {
+          if (i + 1 < len) {
+            result += c + sql[i + 1];
+            i += 2;
+            continue;
+          } else {
+            i++;
+            break; // unterminated trailing backslash in escape string
+          }
+        } else if (c === "'") {
           if (i + 1 < len && sql[i + 1] === "'") {
-            result += sql[i + 1];
+            result += "''";
             i += 2;
             continue;
           }
+          result += "'";
           i++;
-          break; // end of string literal
-        } else if (c === '\\' && i + 1 < len) {
-          result += sql[i + 1];
-          i += 2;
-          continue;
+          terminated = true;
+          break;
+        } else {
+          result += c;
+          i++;
         }
-        i++;
+      }
+      if (!terminated) {
+        throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated single-quoted string in SQL statement');
       }
       continue;
     }
@@ -390,39 +421,44 @@ export function tokenizeAndStripSqlComments(sql: string): string {
     if (ch === '"') {
       result += ch;
       i++;
+      let terminated = false;
       while (i < len) {
         const c = sql[i];
-        result += c;
         if (c === '"') {
-          // Check for escaped quote ""
           if (i + 1 < len && sql[i + 1] === '"') {
-            result += sql[i + 1];
+            result += '""';
             i += 2;
             continue;
           }
+          result += '"';
           i++;
-          break; // end of quoted identifier
+          terminated = true;
+          break;
+        } else {
+          result += c;
+          i++;
         }
-        i++;
+      }
+      if (!terminated) {
+        throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated double-quoted identifier in SQL statement');
       }
       continue;
     }
 
     // 3. Dollar-quoted string literal: $tag$...$tag$ or $$...$$
-    if (ch === '$' && (next === '$' || /^[a-zA-Z_0-9]/.test(next))) {
-      const match = sql.slice(i).match(/^\$([a-zA-Z_0-9]*)\$/);
-      if (match) {
-        const tag = match[0];
+    // PostgreSQL delimiter tag grammar: ^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$ (tags cannot begin with a digit)
+    if (ch === '$') {
+      const tagMatch = sql.slice(i).match(/^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$/);
+      if (tagMatch) {
+        const tag = tagMatch[0];
         result += tag;
         i += tag.length;
         const closeIdx = sql.indexOf(tag, i);
-        if (closeIdx !== -1) {
-          result += sql.slice(i, closeIdx + tag.length);
-          i = closeIdx + tag.length;
-        } else {
-          result += sql.slice(i);
-          i = len;
+        if (closeIdx === -1) {
+          throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated dollar-quoted string in SQL statement');
         }
+        result += sql.slice(i, closeIdx + tag.length);
+        i = closeIdx + tag.length;
         continue;
       }
     }
@@ -452,6 +488,9 @@ export function tokenizeAndStripSqlComments(sql: string): string {
           i++;
         }
       }
+      if (depth > 0) {
+        throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated block comment in SQL statement');
+      }
       result += ' '; // replace comment with single space
       continue;
     }
@@ -465,9 +504,12 @@ export function tokenizeAndStripSqlComments(sql: string): string {
 }
 
 /**
- * PostgreSQL-Aware Statement Splitter (F14.5 Revision 20.8).
+ * PostgreSQL-Aware Statement Splitter (F14.5 Revision 20.9).
  * Splits multiple SQL statements on ';' boundaries ONLY when ';' occurs outside of
  * string literals, dollar-quoted blocks, quoted identifiers, and comments.
+ *
+ * Adheres strictly to PostgreSQL lexical rules and fails closed with CRITICAL_BOUNDARY_ERROR
+ * on any unterminated lexical construct.
  */
 export function splitSqlStatements(sql: string): string[] {
   const statements: string[] = [];
@@ -479,68 +521,95 @@ export function splitSqlStatements(sql: string): string[] {
     const ch = sql[i];
     const next = i + 1 < len ? sql[i + 1] : '';
 
-    if (ch === "'") {
-      current += ch;
+    // 1. Single-quoted string literal: ordinary ('...') or C-style escape (E'...' / e'...')
+    const isEscapePrefix = (ch === 'E' || ch === 'e') && next === "'" && (i === 0 || !/[a-zA-Z0-9_"]/.test(sql[i - 1]));
+    if (isEscapePrefix || ch === "'") {
+      const isEscapeString = isEscapePrefix;
+      if (isEscapePrefix) {
+        current += ch;
+        i++;
+      }
+      current += sql[i];
       i++;
+      let terminated = false;
       while (i < len) {
         const c = sql[i];
-        current += c;
-        if (c === "'") {
+        if (isEscapeString && c === '\\') {
+          if (i + 1 < len) {
+            current += c + sql[i + 1];
+            i += 2;
+            continue;
+          } else {
+            i++;
+            break;
+          }
+        } else if (c === "'") {
           if (i + 1 < len && sql[i + 1] === "'") {
-            current += sql[i + 1];
+            current += "''";
             i += 2;
             continue;
           }
+          current += "'";
           i++;
+          terminated = true;
           break;
-        } else if (c === '\\' && i + 1 < len) {
-          current += sql[i + 1];
-          i += 2;
-          continue;
+        } else {
+          current += c;
+          i++;
         }
-        i++;
+      }
+      if (!terminated) {
+        throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated single-quoted string in SQL statement');
       }
       continue;
     }
 
+    // 2. Double-quoted identifier: "..."
     if (ch === '"') {
       current += ch;
       i++;
+      let terminated = false;
       while (i < len) {
         const c = sql[i];
-        current += c;
         if (c === '"') {
           if (i + 1 < len && sql[i + 1] === '"') {
-            current += sql[i + 1];
+            current += '""';
             i += 2;
             continue;
           }
+          current += '"';
           i++;
+          terminated = true;
           break;
+        } else {
+          current += c;
+          i++;
         }
-        i++;
+      }
+      if (!terminated) {
+        throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated double-quoted identifier in SQL statement');
       }
       continue;
     }
 
-    if (ch === '$' && (next === '$' || /^[a-zA-Z_0-9]/.test(next))) {
-      const match = sql.slice(i).match(/^\$([a-zA-Z_0-9]*)\$/);
-      if (match) {
-        const tag = match[0];
+    // 3. Dollar-quoted string literal: $tag$...$tag$ or $$...$$
+    if (ch === '$') {
+      const tagMatch = sql.slice(i).match(/^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$/);
+      if (tagMatch) {
+        const tag = tagMatch[0];
         current += tag;
         i += tag.length;
         const closeIdx = sql.indexOf(tag, i);
-        if (closeIdx !== -1) {
-          current += sql.slice(i, closeIdx + tag.length);
-          i = closeIdx + tag.length;
-        } else {
-          current += sql.slice(i);
-          i = len;
+        if (closeIdx === -1) {
+          throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated dollar-quoted string in SQL statement');
         }
+        current += sql.slice(i, closeIdx + tag.length);
+        i = closeIdx + tag.length;
         continue;
       }
     }
 
+    // 4. Line comment: -- ... until \n or EOF
     if (ch === '-' && next === '-') {
       i += 2;
       while (i < len && sql[i] !== '\n') i++;
@@ -548,6 +617,7 @@ export function splitSqlStatements(sql: string): string[] {
       continue;
     }
 
+    // 5. Block comment: /* ... */ with support for PostgreSQL nested block comments
     if (ch === '/' && next === '*') {
       i += 2;
       let depth = 1;
@@ -562,10 +632,14 @@ export function splitSqlStatements(sql: string): string[] {
           i++;
         }
       }
+      if (depth > 0) {
+        throw new Error('CRITICAL_BOUNDARY_ERROR: Lexical analysis error: Unterminated block comment in SQL statement');
+      }
       current += ' ';
       continue;
     }
 
+    // Statement boundary
     if (ch === ';') {
       const trimmed = current.trim();
       if (trimmed.length > 0) {
@@ -621,7 +695,10 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
   const normalizedRawSql = tokenizeAndStripSqlComments(singleStmt);
 
   // Normalize string literals for relation and administrative keyword inspection
-  const cleanSql = normalizedRawSql.replace(/'(?:''|[^'])*'/g, "''").trim();
+  const cleanSql = normalizedRawSql
+    .replace(/\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$[\s\S]*?\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$/g, "''")
+    .replace(/\bE'(?:\\.|''|[^'])*'|'(?:''|[^'])*'/gi, "''")
+    .trim();
   const upper = cleanSql.toUpperCase();
 
   // 2. Reject destructive administrative and unsupported mutation commands:
@@ -676,6 +753,7 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     'least',
     'now',
     'current_setting',
+    'pg_backend_pid',
   ]);
   const syntaxKeywords = new Set([
     'values', 'in', 'on', 'with', 'as', 'targets', 'if', 'exists', 'extract',
@@ -980,10 +1058,12 @@ export class ProductionDatabaseBoundaryPoolAdapter {
   async #ensureConnectionInitialized(rawClient: any): Promise<void> {
     if (!rawClient || typeof rawClient.query !== 'function') {
       if (rawClient) {
-        if (typeof rawClient.release === 'function') {
-          try { rawClient.release(); } catch {}
-        } else if (typeof rawClient.destroy === 'function') {
+        if (typeof rawClient.destroy === 'function') {
           try { rawClient.destroy(); } catch {}
+        } else if (typeof rawClient.release === 'function') {
+          try {
+            rawClient.release(new Error('MALFORMED_CONNECTION_CLIENT_DISCARD'));
+          } catch {}
         }
       }
       throw new Error('CRITICAL_BOUNDARY_ERROR: Acquired connection client does not implement query() interface');
@@ -996,7 +1076,9 @@ export class ProductionDatabaseBoundaryPoolAdapter {
       await rawClient.query('SET search_path = public, pg_temp');
       initializedPhysicalClients.add(rawClient);
     } catch (err: any) {
-      if (typeof rawClient.release === 'function') {
+      if (typeof rawClient.destroy === 'function') {
+        try { rawClient.destroy(); } catch {}
+      } else if (typeof rawClient.release === 'function') {
         try { rawClient.release(err); } catch {}
       }
       throw new Error(`CRITICAL_BOUNDARY_ERROR: Failed to establish trusted search_path on connection: ${err.message}`);
