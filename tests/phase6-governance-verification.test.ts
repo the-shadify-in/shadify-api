@@ -3747,6 +3747,26 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized schema 'private' forbidden through outbox boundary/);
 
       await expect(async () => {
+        await defaultProcessor.pool.query('SET search_path = untrusted, public');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SET LOCAL search_path = evil');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('RESET search_path');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('RESET ALL');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path via RESET ALL is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT set_config('search_path', 'evil', false) FROM outbox_events");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Modification of search_path via set_config is strictly forbidden|Function call 'set_config' forbidden)/);
+
+      await expect(async () => {
         await defaultProcessor.pool.query('SELECT 1');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Standalone SELECT without target table forbidden/);
 
@@ -3773,6 +3793,26 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       await expect(async () => {
         await defaultProcessor.pool.query('SELECT * FROM outbox_events, "private"."secrets"');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized schema 'private' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SET search_path = untrusted, public');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SET LOCAL search_path = evil');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('RESET search_path');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('RESET ALL');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path via RESET ALL is strictly forbidden through boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT set_config('search_path', 'evil', false) FROM outbox_events");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Modification of search_path via set_config is strictly forbidden|Function call 'set_config' forbidden)/);
 
       await expect(async () => {
         await defaultProcessor.pool.query('SELECT 1');

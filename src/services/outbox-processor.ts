@@ -265,6 +265,17 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     throw new Error('CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden through outbox boundary');
   }
 
+  // Reject any attempt to modify or reset search_path through the boundary
+  if (/\b(?:SET|RESET)\s+(?:SESSION\s+|LOCAL\s+)?search_path\b/i.test(singleStmt)) {
+    throw new Error('CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden through boundary');
+  }
+  if (/\bRESET\s+ALL\b/i.test(singleStmt)) {
+    throw new Error('CRITICAL_BOUNDARY_ERROR: Modification of search_path via RESET ALL is strictly forbidden through boundary');
+  }
+  if (/\bset_config\s*\(\s*['"]search_path['"]/i.test(singleStmt)) {
+    throw new Error('CRITICAL_BOUNDARY_ERROR: Modification of search_path via set_config is strictly forbidden through boundary');
+  }
+
   // 4. Strict allowlist check:
   // Transaction control and session commands
   if (/^(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT)\b/.test(upper)) {
@@ -551,6 +562,16 @@ export class ProductionDatabaseBoundaryPoolAdapter {
     };
     if (internalCreationToken === TRUSTED_PRODUCTION_ADAPTER_TOKEN) {
       trustedProductionAdapters.add(this);
+    }
+    // Enforce fixed trusted search_path on physical client connections where event emitter is supported:
+    if (typeof rawPool.on === 'function') {
+      try {
+        rawPool.on('connect', (client: any) => {
+          if (typeof client?.query === 'function') {
+            client.query('SET search_path = public, pg_temp').catch(() => {});
+          }
+        });
+      } catch {}
     }
   }
 
