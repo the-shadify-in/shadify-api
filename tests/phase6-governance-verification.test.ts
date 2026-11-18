@@ -3707,6 +3707,26 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Standalone SELECT without target table forbidden|Function call 'pg_sleep' forbidden)/);
 
       await expect(async () => {
+        await defaultProcessor.pool.query('SELECT pg_sleep(100) FROM outbox_events');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'pg_sleep' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT nextval('some_sequence') FROM outbox_events");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'nextval' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("UPDATE outbox_events SET status = 1 WHERE pg_sleep(1) IS NULL");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'pg_sleep' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT setval('some_seq', 1) FROM outbox_events");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'setval' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT pg_catalog.pg_sleep(100) FROM outbox_events');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'pg_sleep' forbidden through outbox boundary/);
+
+      await expect(async () => {
         await defaultProcessor.pool.query("SELECT pg_read_file('/etc/passwd')");
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Standalone SELECT without target table forbidden|Function call 'pg_read_file' forbidden)/);
 
@@ -3871,12 +3891,14 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       );
 
       // 7. When rawClient.release(err) itself throws during rollback failure cleanup,
-      // the primary rollback error is preserved and the client remains marked permanently destroyed
+      // the primary rollback error is preserved, destroy() is invoked as secondary fallback,
+      // and the client remains marked permanently destroyed
       const mockBrokenRawClient = {
         query: vi.fn().mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(new Error('PRIMARY_ROLLBACK_FAILURE')),
         release: vi.fn().mockImplementation(() => {
           throw new Error('SECONDARY_SOCKET_RELEASE_EXCEPTION');
         }),
+        destroy: vi.fn(),
       };
       const mockBrokenPool = { connect: async () => mockBrokenRawClient, query: vi.fn() };
       const brokenAdapter = new ProductionDatabaseBoundaryPoolAdapter(mockBrokenPool, () => {});
@@ -3888,6 +3910,47 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       );
       expect(client4.isDiscarded()).toBe(true);
       expect(client4.getRollbackError()?.message).toBe('PRIMARY_ROLLBACK_FAILURE');
+      // Assert destruction fallback: rawClient.release threw, so destroy() was explicitly invoked!
+      expect(mockBrokenRawClient.release).toHaveBeenCalledTimes(1);
+      expect(mockBrokenRawClient.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it('F15.5 Direct Rollback-Query Failure & Exactly-Once Client Release: when client.query("ROLLBACK") fails inside query(), rawClient.release is called with rollback error immediately, and subsequent finally { await client.release() } does NOT double-release', async () => {
+      const rollbackErr = new Error('SIMULATED_ROLLBACK_QUERY_FAILURE');
+      const mockRawClient = {
+        query: vi.fn()
+          .mockResolvedValueOnce({ rows: [] }) // BEGIN
+          .mockRejectedValueOnce(rollbackErr), // ROLLBACK fails
+        release: vi.fn(),
+      };
+      const mockPool = {
+        connect: async () => mockRawClient,
+        query: vi.fn(),
+      };
+      const adapter = new ProductionDatabaseBoundaryPoolAdapter(mockPool, () => {});
+      const client = await adapter.connect();
+
+      await client.query('BEGIN');
+      expect(client.isInTransaction()).toBe(true);
+
+      // Explicitly invoke client.query('ROLLBACK') which fails:
+      await expect(client.query('ROLLBACK')).rejects.toThrow('SIMULATED_ROLLBACK_QUERY_FAILURE');
+
+      expect(client.isInTransaction()).toBe(false);
+      expect(client.isDiscarded()).toBe(true);
+      expect(client.getRollbackError()).toBe(rollbackErr);
+
+      // Verify rawClient.release was called with the rollback error:
+      expect(mockRawClient.release).toHaveBeenCalledTimes(1);
+      expect(mockRawClient.release).toHaveBeenCalledWith(rollbackErr);
+
+      // Now simulate worker's outer finally block: await client.release();
+      await expect(client.release()).rejects.toThrow(
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed/
+      );
+
+      // Crucial assertion: rawClient.release was called EXACTLY ONCE across the entire lifecycle!
+      expect(mockRawClient.release).toHaveBeenCalledTimes(1);
     });
 
     it('F15.5 Production Worker Error Handling: processBatch propagates combined error on rollback failure and preserves processing error across cleanup', async () => {
@@ -3915,8 +3978,11 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         /PROCESSING_ERROR: SIMULATED_QUERY_DEADLOCK \| ROLLBACK_FAILED: SIMULATED_ROLLBACK_SOCKET_CLOSED/
       );
 
-      // Verify cleanup was still awaited in finally
-      expect(mockRawClient.release).toHaveBeenCalled();
+      // Verify cleanup was still awaited in finally and rawClient.release was called exactly once with rollback error
+      expect(mockRawClient.release).toHaveBeenCalledTimes(1);
+      expect(mockRawClient.release).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'SIMULATED_ROLLBACK_SOCKET_CLOSED' })
+      );
     });
 
     it('F15.5 (Mocked Unit Test) Two-Worker processBatch fencing logic: in-memory state simulation of lease expiration, stale worker rejection, and idempotent completion', async () => {
