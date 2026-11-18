@@ -317,23 +317,43 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     .replace(/\bFOR\s+UPDATE(\s+(?:NOWAIT|SKIP\s+LOCKED))?\b/gi, ' ')
     .replace(/\bDO\s+UPDATE\s+SET\b/gi, ' ');
 
-  // Extract all table identifiers referenced in FROM, JOIN, UPDATE, INTO, TABLE
-  const tableTargetMatches = withoutLockingClause.matchAll(/\b(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+(["`]?\w+["`]?\.)?(["`]?\w+["`]?)/gi);
-  for (const match of tableTargetMatches) {
-    const rawTable = (match[2] || '').replace(/["`]/g, '').toLowerCase();
-    const rawSchema = (match[1] || '').replace(/[".`]/g, '').toLowerCase();
+  const permittedTables = new Set(['outbox_events', 'audit_log', 'operator_identities', 'targets', 'dual']);
+  const permittedSchemas = new Set(['', 'public']);
 
-    // Permitted targets: outbox_events, audit_log, operator_identities, and local CTE aliases (targets, dual)
-    const isPermittedTarget =
-      rawTable === 'outbox_events' ||
-      rawTable === 'audit_log' ||
-      rawTable === 'operator_identities' ||
-      rawTable === 'targets' ||
-      rawTable === 'dual';
+  function validateTargetRelation(rawIdentifier: string): void {
+    const cleaned = rawIdentifier.trim().replace(/["`]/g, '');
+    if (!cleaned) return;
+    const parts = cleaned.split('.');
+    const schema = parts.length > 1 ? (parts[0] || '').toLowerCase() : '';
+    const table = (parts.length > 1 ? parts[1] : parts[0])?.toLowerCase() || '';
 
-    if (!isPermittedTarget) {
-      throw new Error(`CRITICAL_BOUNDARY_ERROR: Unauthorized table target '${rawSchema ? rawSchema + '.' : ''}${rawTable}' forbidden through outbox boundary`);
+    if (!permittedSchemas.has(schema)) {
+      throw new Error(`CRITICAL_BOUNDARY_ERROR: Unauthorized schema '${schema}' forbidden through outbox boundary`);
     }
+    if (!permittedTables.has(table)) {
+      throw new Error(`CRITICAL_BOUNDARY_ERROR: Unauthorized table target '${schema ? schema + '.' : ''}${table}' forbidden through outbox boundary`);
+    }
+  }
+
+  // Validate comma-separated relations in FROM clause (e.g. FROM outbox_events, users)
+  const fromClauseMatches = withoutLockingClause.matchAll(/\bFROM\s+([^;]+?)(?=\b(?:WHERE|GROUP|HAVING|ORDER|LIMIT|WINDOW|UNION|RETURNING|FOR|ON|JOIN)\b|$)/gi);
+  for (const fromMatch of fromClauseMatches) {
+    const fromBody = fromMatch[1] || '';
+    const relationEntries = fromBody.split(',');
+    for (const rawEntry of relationEntries) {
+      const token = rawEntry.trim().split(/\s+/)[0] || '';
+      if (!token || token.startsWith('(')) continue;
+      validateTargetRelation(token);
+    }
+  }
+
+  // Validate JOIN, UPDATE, and INTO targets
+  const otherTargetMatches = withoutLockingClause.matchAll(/\b(?:JOIN|UPDATE|INTO|TABLE)\s+(["`]?\w+["`]?\.)?(["`]?\w+["`]?)/gi);
+  for (const match of otherTargetMatches) {
+    const rawSchema = (match[1] || '').replace(/[".`]/g, '');
+    const rawTable = (match[2] || '').replace(/["`]/g, '');
+    const fullIdent = rawSchema ? `${rawSchema}.${rawTable}` : rawTable;
+    validateTargetRelation(fullIdent);
   }
 }
 
@@ -426,6 +446,7 @@ export class ProductionBoundaryClient {
 
     let secondaryError: Error | null = null;
     let fallbackNeeded = false;
+    let physicalDestructionConfirmed = false;
 
     if (!this.#isRawClientReleased) {
       this.#isRawClientReleased = true;
@@ -446,19 +467,23 @@ export class ProductionBoundaryClient {
       if (fallbackNeeded && typeof this.#rawClient.destroy === 'function') {
         try {
           this.#rawClient.destroy();
+          physicalDestructionConfirmed = true;
         } catch (destErr: any) {
           console.error('Tertiary error during client.destroy():', destErr);
         }
       }
     }
 
-    const cleanupError = new Error(
-      `CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed: ${primaryErr.message}`
-    );
+    const message = fallbackNeeded && !physicalDestructionConfirmed
+      ? `CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, socket destruction attempted but could not be confirmed: ${primaryErr.message}`
+      : `CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destruction requested: ${primaryErr.message}`;
+
+    const cleanupError = new Error(message);
     (cleanupError as any).primaryError = primaryErr;
     if (secondaryError) {
       (cleanupError as any).secondaryError = secondaryError;
     }
+    (cleanupError as any).physicalDestructionConfirmed = physicalDestructionConfirmed;
     throw cleanupError;
   }
 

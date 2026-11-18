@@ -3735,6 +3735,46 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'dblink_connect' forbidden/);
 
       await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM untrusted_schema.outbox_events');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized schema 'untrusted_schema' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM outbox_events, users');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'users' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM outbox_events, "private"."secrets"');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized schema 'private' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT 1');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Standalone SELECT without target table forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT pg_sleep(100)');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Standalone SELECT without target table forbidden|Function call 'pg_sleep' forbidden)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT pg_read_file('/etc/passwd')");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Standalone SELECT without target table forbidden|Function call 'pg_read_file' forbidden)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT dblink_connect('evil') FROM outbox_events");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'dblink_connect' forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM untrusted_schema.outbox_events');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized schema 'untrusted_schema' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM outbox_events, users');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'users' forbidden through outbox boundary/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM outbox_events, "private"."secrets"');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized schema 'private' forbidden through outbox boundary/);
+
+      await expect(async () => {
         await defaultProcessor.pool.query('SELECT 1');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Standalone SELECT without target table forbidden/);
 
@@ -3870,7 +3910,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       await client3.query('BEGIN');
 
       await expect(client3.release()).rejects.toThrow(
-        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed/
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destruction requested/
       );
 
       expect(client3.isDiscarded()).toBe(true);
@@ -3881,7 +3921,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
 
       // 5. Repeated release after failure returns the same rejected promise without re-releasing
       await expect(client3.release()).rejects.toThrow(
-        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed/
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destruction requested/
       );
       expect(mockRawClient.release).toHaveBeenCalledTimes(1); // STILL 1!
 
@@ -3906,13 +3946,39 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       await client4.query('BEGIN');
 
       await expect(client4.release()).rejects.toThrow(
-        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed: PRIMARY_ROLLBACK_FAILURE/
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destruction requested: PRIMARY_ROLLBACK_FAILURE/
       );
       expect(client4.isDiscarded()).toBe(true);
       expect(client4.getRollbackError()?.message).toBe('PRIMARY_ROLLBACK_FAILURE');
       // Assert destruction fallback: rawClient.release threw, so destroy() was explicitly invoked!
       expect(mockBrokenRawClient.release).toHaveBeenCalledTimes(1);
       expect(mockBrokenRawClient.destroy).toHaveBeenCalledTimes(1);
+
+      // 8. When BOTH rawClient.release(err) and destroy() throw, socket destruction cannot be confirmed
+      // and is accurately reported as unconfirmed without overstating the guarantee:
+      const mockDoubleBrokenRawClient = {
+        query: vi.fn().mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(new Error('PRIMARY_ROLLBACK_FAILURE')),
+        release: vi.fn().mockImplementation(() => {
+          throw new Error('SECONDARY_SOCKET_RELEASE_EXCEPTION');
+        }),
+        destroy: vi.fn().mockImplementation(() => {
+          throw new Error('TERTIARY_DESTROY_EXCEPTION');
+        }),
+      };
+      const doubleBrokenAdapter = new ProductionDatabaseBoundaryPoolAdapter(
+        { connect: async () => mockDoubleBrokenRawClient, query: vi.fn() },
+        () => {}
+      );
+      const client5 = await doubleBrokenAdapter.connect();
+      await client5.query('BEGIN');
+
+      await expect(client5.release()).rejects.toThrow(
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, socket destruction attempted but could not be confirmed: PRIMARY_ROLLBACK_FAILURE/
+      );
+      expect(client5.isDiscarded()).toBe(true);
+      expect(client5.getRollbackError()?.message).toBe('PRIMARY_ROLLBACK_FAILURE');
+      expect(mockDoubleBrokenRawClient.release).toHaveBeenCalledTimes(1);
+      expect(mockDoubleBrokenRawClient.destroy).toHaveBeenCalledTimes(1);
     });
 
     it('F15.5 Direct Rollback-Query Failure & Exactly-Once Client Release: when client.query("ROLLBACK") fails inside query(), rawClient.release is called with rollback error immediately, and subsequent finally { await client.release() } does NOT double-release', async () => {
@@ -3946,7 +4012,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
 
       // Now simulate worker's outer finally block: await client.release();
       await expect(client.release()).rejects.toThrow(
-        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed/
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destruction requested/
       );
 
       // Crucial assertion: rawClient.release was called EXACTLY ONCE across the entire lifecycle!
