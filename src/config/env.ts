@@ -28,7 +28,7 @@ try {
   if (process.env.NODE_ENV === 'test') {
     // Provide safe test defaults
     parsedEnv = envSchema.parse({
-      DATABASE_URL: 'postgresql://shadify_api_role:password@localhost:5432/shadify_db?schema=public',
+      DATABASE_URL: process.env.DATABASE_URL || 'postgresql://cvs@127.0.0.1:5433/shadify_migrated_test',
       CLOUDFLARE_HMAC_SECRET: 'test-secret-at-least-16-characters-long',
       R2_ACCOUNT_ID: 'test-account',
       R2_ACCESS_KEY_ID: 'test-key',

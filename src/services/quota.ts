@@ -18,12 +18,13 @@ export interface CompletionResult {
   weddingId: string;
   actualBytes: string;
   outboxEventId: string | null;
+  recovered?: boolean;
 }
 
 export class QuotaService {
   static async reserveQuota(params: {
     weddingId: string;
-    expectedBytes: number;
+    expectedBytes: number | string;
     bucketName: string;
     objectKey: string;
     isMultipart: boolean;
@@ -56,20 +57,23 @@ export class QuotaService {
 
   static async completeSession(
     sessionId: string,
-    actualBytes: number
+    actualBytes: number | string,
+    sha256?: string
   ): Promise<CompletionResult> {
     const client = await dbPool.connect();
     try {
       const res = await client.query(
-        `SELECT photo_id, wedding_id, actual_bytes, outbox_event_id FROM public.complete_upload_session($1, $2)`,
-        [sessionId, actualBytes]
+        `SELECT out_photo_id AS photo_id, out_wedding_id AS wedding_id, out_actual_bytes AS actual_bytes, out_recovered AS recovered
+         FROM public.complete_upload_session($1, $2, $3)`,
+        [sessionId, actualBytes, sha256 || '0000000000000000000000000000000000000000000000000000000000000000']
       );
 
       return {
         photoId: res.rows[0].photo_id,
         weddingId: res.rows[0].wedding_id,
-        actualBytes: res.rows[0].actual_bytes,
-        outboxEventId: res.rows[0].outbox_event_id,
+        actualBytes: String(res.rows[0].actual_bytes),
+        outboxEventId: null,
+        recovered: res.rows[0].recovered ?? false,
       };
     } finally {
       client.release();

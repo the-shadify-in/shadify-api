@@ -5,6 +5,8 @@ import rateLimit from '@fastify/rate-limit';
 import { hmacPlugin } from './plugins/hmac.js';
 import { healthRoutes } from './routes/health.js';
 import { uploadRoutes } from './routes/v1/uploads.js';
+import { photoRoutes } from './routes/v1/photos.js';
+import { adminOutboxRoutes } from './routes/v1/admin-outbox.js';
 import { internalBffRoutes } from './routes/internal-bff/admin.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -32,6 +34,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   // Routes
   await fastify.register(healthRoutes);
   await fastify.register(uploadRoutes);
+  await fastify.register(photoRoutes);
+  await fastify.register(adminOutboxRoutes);
   await fastify.register(internalBffRoutes);
 
   return fastify;
