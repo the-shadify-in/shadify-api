@@ -231,7 +231,9 @@ export function isTrustedProductionAdapter(pool: any): boolean {
  *    - Outbox queries: SELECT ... FROM outbox_events, UPDATE outbox_events ...
  *    - Replay CTE: WITH targets AS (SELECT id, ... FROM outbox_events ...) UPDATE outbox_events ...
  *    - Audit log: INSERT INTO audit_log ...
- *    Any query targeting unauthorized tables or unpermitted syntax fails closed.
+ *    - Rejects standalone SELECTs without table targets (e.g. SELECT pg_sleep(100), SELECT 1).
+ *    - Rejects unauthorized function calls (only clock_timestamp, count, jsonb_build_object, coalesce are permitted).
+ *    Any query targeting unauthorized tables, functions, or unpermitted syntax fails closed.
  */
 export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
   if (typeof sql !== 'string' || sql.trim().length === 0) {
@@ -272,10 +274,42 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     return;
   }
 
-  // Allowed data operations must target only outbox_events or audit_log
+  // Allowed data operations must start with SELECT, UPDATE, INSERT INTO, or WITH targets AS
   const isAllowedCommand = /^(SELECT|UPDATE|INSERT\s+INTO|WITH\s+targets\s+AS)\b/i.test(singleStmt);
   if (!isAllowedCommand) {
     throw new Error(`CRITICAL_BOUNDARY_ERROR: Unsupported SQL command forbidden through boundary: ${upper.slice(0, 30)}`);
+  }
+
+  // 5. Rejection of standalone SELECT without FROM clause (e.g. SELECT pg_sleep(100), SELECT 1)
+  if (/^SELECT\b/i.test(singleStmt) && !/\bFROM\s+/i.test(singleStmt)) {
+    throw new Error(`CRITICAL_BOUNDARY_ERROR: Standalone SELECT without target table forbidden through outbox boundary: ${singleStmt.slice(0, 30)}`);
+  }
+
+  // 6. Function calls allowlist: only known, side-effect-free outbox functions permitted
+  const allowedFunctions = new Set([
+    'clock_timestamp',
+    'count',
+    'jsonb_build_object',
+    'coalesce',
+    'nullif',
+    'greatest',
+    'least',
+    'now',
+  ]);
+  const syntaxKeywords = new Set([
+    'values', 'in', 'on', 'with', 'as', 'targets', 'if', 'exists', 'extract',
+    'interval', 'set', 'where', 'and', 'or', 'not', 'case', 'when', 'then',
+    'else', 'from', 'join', 'into', 'table', 'any', 'all', 'select', 'update',
+    'insert', 'conflict', 'key', 'unique', 'primary', 'foreign', 'references',
+    'check', 'constraint', 'default', 'over', 'partition', 'order', 'by',
+    'group', 'having', 'filter', 'outbox_events', 'audit_log', 'operator_identities', 'dual'
+  ]);
+  const functionMatches = singleStmt.matchAll(/\b([a-zA-Z_]\w*)\s*\(/g);
+  for (const match of functionMatches) {
+    const fnName = (match[1] || '').toLowerCase();
+    if (!syntaxKeywords.has(fnName) && !allowedFunctions.has(fnName)) {
+      throw new Error(`CRITICAL_BOUNDARY_ERROR: Function call '${fnName}' forbidden through outbox boundary`);
+    }
   }
 
   // Strip FOR UPDATE locking clauses and ON CONFLICT DO UPDATE clauses before checking table targets
@@ -317,9 +351,9 @@ export const defaultProductionBoundaryInterceptor: QueryInterceptorHook = (
  * 1. Fail-closed query interception via assertProductionSqlPolicy.
  * 2. Real-time transaction state tracking (inTransaction).
  * 3. Awaited rollback on release when a transaction is left in-flight.
- * 4. Immediate connection destruction via rawClient.release(err) on rollback failure (uncertain socket state).
- * 5. Idempotent release using a single shared promise (raw connection released at most once).
- * 6. Error preservation: preserves rollback error without losing diagnostic context.
+ * 4. Immediate connection destruction via rawClient.release(err) and destroy() fallback on rollback failure.
+ * 5. Exactly-once terminal release using unified lifecycle state and shared promise memoization.
+ * 6. Error preservation: preserves rollback error as primary failure; records secondary release/destruction errors.
  */
 export class ProductionBoundaryClient {
   #rawClient: any;
@@ -328,6 +362,7 @@ export class ProductionBoundaryClient {
   #isDestroyed: boolean = false;
   #rollbackError: Error | null = null;
   #releasePromise: Promise<void> | null = null;
+  #isRawClientReleased: boolean = false;
 
   constructor(rawClient: any, onQuery: QueryInterceptorHook) {
     this.#rawClient = rawClient;
@@ -374,15 +409,57 @@ export class ProductionBoundaryClient {
       return res;
     } catch (err) {
       if (/^(ROLLBACK|ABORT)\b/.test(upper)) {
-        this.#inTransaction = false;
-        this.#isDestroyed = true;
-        this.#rollbackError = err instanceof Error ? err : new Error(String(err));
-        if (typeof this.#rawClient.release === 'function') {
-          this.#rawClient.release(err);
+        const rollbackErr = err instanceof Error ? err : new Error(String(err));
+        if (!this.#releasePromise) {
+          this.#releasePromise = this.#destroyConnection(rollbackErr);
+          this.#releasePromise.catch(() => {});
         }
       }
       throw err;
     }
+  }
+
+  async #destroyConnection(primaryErr: Error): Promise<void> {
+    this.#isDestroyed = true;
+    this.#inTransaction = false;
+    this.#rollbackError = primaryErr;
+
+    let secondaryError: Error | null = null;
+    let fallbackNeeded = false;
+
+    if (!this.#isRawClientReleased) {
+      this.#isRawClientReleased = true;
+
+      if (typeof this.#rawClient.release === 'function') {
+        try {
+          this.#rawClient.release(primaryErr); // Instruct pg-pool to discard and destroy the socket
+        } catch (relErr: any) {
+          secondaryError = relErr instanceof Error ? relErr : new Error(String(relErr));
+          console.error('Secondary error during client.release(err):', relErr);
+          fallbackNeeded = true;
+        }
+      } else {
+        fallbackNeeded = true;
+      }
+
+      // Explicit destruction fallback when release(err) throws or is missing:
+      if (fallbackNeeded && typeof this.#rawClient.destroy === 'function') {
+        try {
+          this.#rawClient.destroy();
+        } catch (destErr: any) {
+          console.error('Tertiary error during client.destroy():', destErr);
+        }
+      }
+    }
+
+    const cleanupError = new Error(
+      `CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed: ${primaryErr.message}`
+    );
+    (cleanupError as any).primaryError = primaryErr;
+    if (secondaryError) {
+      (cleanupError as any).secondaryError = secondaryError;
+    }
+    throw cleanupError;
   }
 
   /**
@@ -399,31 +476,24 @@ export class ProductionBoundaryClient {
   }
 
   async #performRelease(): Promise<void> {
+    if (this.#isRawClientReleased) {
+      return;
+    }
+
     if (this.#inTransaction) {
       try {
         await this.#rawClient.query('ROLLBACK');
         this.#inTransaction = false;
+        this.#isRawClientReleased = true;
         if (typeof this.#rawClient.release === 'function') {
           this.#rawClient.release(); // Clean release back to pool
         }
       } catch (err: any) {
-        this.#isDestroyed = true;
-        this.#inTransaction = false;
-        this.#rollbackError = err instanceof Error ? err : new Error(String(err));
-        if (typeof this.#rawClient.release === 'function') {
-          try {
-            this.#rawClient.release(err); // Instruct pg-pool to discard and destroy the physical socket
-          } catch (relErr) {
-            console.error('Secondary error during client.release(err):', relErr);
-          }
-        } else if (typeof this.#rawClient.destroy === 'function') {
-          try {
-            this.#rawClient.destroy();
-          } catch {}
-        }
-        throw new Error(`CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed: ${err?.message || err}`);
+        const rollbackErr = err instanceof Error ? err : new Error(String(err));
+        return await this.#destroyConnection(rollbackErr);
       }
     } else {
+      this.#isRawClientReleased = true;
       if (typeof this.#rawClient.release === 'function') {
         this.#rawClient.release();
       }

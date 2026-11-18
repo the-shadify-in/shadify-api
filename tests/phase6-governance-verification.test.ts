@@ -3596,13 +3596,13 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
 
       // 4. Assert client.query path triggers mandatory interceptor
       const client = await processor.pool.connect();
-      await client.query('SELECT client_probe');
+      await client.query('SELECT id FROM outbox_events -- client_probe');
       client.release();
-      expect(interceptedQueries).toContain('client.query:SELECT client_probe');
+      expect(interceptedQueries).toContain('client.query:SELECT id FROM outbox_events -- client_probe');
 
       // 5. Assert pool.query path triggers mandatory interceptor
-      await processor.pool.query('SELECT pool_probe');
-      expect(interceptedQueries).toContain('pool.query:SELECT pool_probe');
+      await processor.pool.query('SELECT id FROM outbox_events -- pool_probe');
+      expect(interceptedQueries).toContain('pool.query:SELECT id FROM outbox_events -- pool_probe');
     });
 
     it('F14.5 Negative Security Suite: enforces production SQL policy, rejects destructive commands, CTE mutations, and blocks untrusted or no-op interceptors', async () => {
@@ -3693,7 +3693,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         await defaultProcessor.pool.query('WITH target AS (SELECT id FROM private.photos) UPDATE outbox_events SET status = 1');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
 
-      // 6. Default interceptor strictly blocks queries targeting unauthorized tables
+      // 6. Default interceptor strictly blocks queries targeting unauthorized tables, standalone functions, and side effects
       await expect(async () => {
         await defaultProcessor.pool.query('SELECT * FROM weddings WHERE id = 1');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'weddings' forbidden/);
@@ -3701,6 +3701,22 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       await expect(async () => {
         await defaultProcessor.pool.query('UPDATE users SET name = "attacker"');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'users' forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT pg_sleep(100)');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Standalone SELECT without target table forbidden|Function call 'pg_sleep' forbidden)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT pg_read_file('/etc/passwd')");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Standalone SELECT without target table forbidden|Function call 'pg_read_file' forbidden)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("SELECT dblink_connect('evil') FROM outbox_events");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Function call 'dblink_connect' forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT 1');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Standalone SELECT without target table forbidden/);
 
       // Proof: Rejected queries NEVER reached raw driver!
       expect(rawQueryMock).not.toHaveBeenCalled();
