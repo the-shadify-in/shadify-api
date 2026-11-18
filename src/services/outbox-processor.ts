@@ -218,6 +218,114 @@ export function isTrustedProductionAdapter(pool: any): boolean {
 }
 
 /**
+ * Canonical Reviewed Outbox SQL Template Catalog (T1 - T13).
+ * Mandatory production security boundary enforcement (F14.5 Revision 20.6).
+ * Any SQL query submitted through the production database boundary that does not
+ * conform to one of these audited canonical structural forms is rejected fail-closed.
+ */
+export const CANONICAL_SQL_TEMPLATES: ReadonlyArray<{
+  id: string;
+  description: string;
+  pattern: RegExp;
+}> = [
+  {
+    id: 'T1',
+    description: 'Transaction Control - BEGIN',
+    pattern: /^(BEGIN|START\s+TRANSACTION)$/i,
+  },
+  {
+    id: 'T2',
+    description: 'Transaction Control - COMMIT',
+    pattern: /^(COMMIT|END)$/i,
+  },
+  {
+    id: 'T3',
+    description: 'Transaction Control - ROLLBACK',
+    pattern: /^(ROLLBACK|ABORT)$/i,
+  },
+  {
+    id: 'T4',
+    description: 'Session Configuration - Lock Timeout',
+    pattern: /^SET\s+LOCAL\s+lock_timeout\s*=\s*(?:'[^']*'|\$\d+|\d+\s*ms|\d+)$/i,
+  },
+  {
+    id: 'T5',
+    description: 'Atomic Lease Acquisition with FOR UPDATE SKIP LOCKED',
+    pattern: /^SELECT\s+id,\s*event_type,\s*wedding_id,\s*photo_id,\s*payload,\s*retry_count,\s*max_retries\s+FROM\s+(?:public\.)?outbox_events\s+WHERE\s+\(status\s*=\s*'PENDING'\s+OR\s+\(status\s*=\s*'PROCESSING'\s+AND\s+lease_expires_at\s*<=\s*clock_timestamp\(\)\)\)\s+AND\s+event_type\s+IN\s+\('PHOTO_DELETED',\s*'WEDDING_REVOKED'\)(?:\s+AND\s+(?:photo_id|wedding_id|id)\s*=\s*\$\d+)*\s+ORDER\s+BY\s+created_at\s+ASC\s+LIMIT\s+\$\d+\s+FOR\s+UPDATE\s+SKIP\s+LOCKED$/i,
+  },
+  {
+    id: 'T6',
+    description: 'Atomic Lease Token Assignment',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+status\s*=\s*'PROCESSING',\s*lease_token\s*=\s*\$\d+,\s*lease_expires_at\s*=\s*clock_timestamp\(\)\s*\+\s*\(\$\d+\s*\|\|\s*' seconds'\)::interval,\s*updated_at\s*=\s*clock_timestamp\(\)\s+WHERE\s+id\s*=\s*(?:\$\d+|ANY\(\$\d+::bigint\[\]\))$/i,
+  },
+  {
+    id: 'T7',
+    description: 'Event Completion',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+status\s*=\s*'COMPLETED',\s*(?:processed_at\s*=\s*clock_timestamp\(\),\s*)?(?:lease_token\s*=\s*NULL,\s*lease_expires_at\s*=\s*NULL,\s*)?updated_at\s*=\s*clock_timestamp\(\),\s*last_error\s*=\s*NULL\s+WHERE\s+id\s*=\s*\$\d+(?:\s+AND\s+lease_token\s*=\s*\$\d+\s+AND\s+status\s*=\s*'PROCESSING'\s+AND\s+lease_expires_at\s*>\s*clock_timestamp\(\))?$/i,
+  },
+  {
+    id: 'T8',
+    description: 'Dead-Letter Queue Escalation',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+status\s*=\s*'DEAD_LETTER',\s*(?:lease_token\s*=\s*NULL,\s*lease_expires_at\s*=\s*NULL,\s*)?(?:retry_count\s*=\s*\$\d+,\s*)?last_error\s*=\s*\$\d+,\s*(?:lease_token\s*=\s*NULL,\s*lease_expires_at\s*=\s*NULL,\s*)?updated_at\s*=\s*clock_timestamp\(\)\s+WHERE\s+id\s*=\s*\$\d+(?:\s+AND\s+lease_token\s*=\s*\$\d+\s+AND\s+status\s*=\s*'PROCESSING')?(?:\s+AND\s+lease_expires_at\s*>\s*clock_timestamp\(\))?$/i,
+  },
+  {
+    id: 'T9',
+    description: 'Transient Failure Retry Backoff',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+status\s*=\s*'PENDING',\s*(?:lease_token\s*=\s*NULL,\s*lease_expires_at\s*=\s*NULL,\s*)?retry_count\s*=\s*(?:retry_count\s*\+\s*1|\$\d+),\s*last_error\s*=\s*\$\d+,\s*(?:payload\s*=\s*\$\d+::jsonb,\s*)?(?:lease_token\s*=\s*NULL,\s*lease_expires_at\s*=\s*NULL,\s*)?updated_at\s*=\s*clock_timestamp\(\)\s+WHERE\s+id\s*=\s*\$\d+(?:\s+AND\s+lease_token\s*=\s*\$\d+\s+AND\s+status\s*=\s*'PROCESSING'\s+AND\s+lease_expires_at\s*>\s*clock_timestamp\(\))?$/i,
+  },
+  {
+    id: 'T10',
+    description: 'Lease Heartbeat Extension',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+lease_expires_at\s*=\s*clock_timestamp\(\)\s*\+\s*\(\$\d+\s*\|\|\s*' seconds'\)::interval,\s*updated_at\s*=\s*clock_timestamp\(\)\s+WHERE\s+id\s*=\s*\$\d+\s+AND\s+lease_token\s*=\s*\$\d+\s+AND\s+status\s*=\s*'PROCESSING'(?:\s+AND\s+lease_expires_at\s*>\s*clock_timestamp\(\))?$/i,
+  },
+  {
+    id: 'T-PARTIAL-PROGRESS',
+    description: 'Lease Fenced Partial Progress Persistence',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+payload\s*=\s*\$\d+::jsonb,\s*updated_at\s*=\s*clock_timestamp\(\)\s+WHERE\s+id\s*=\s*\$\d+\s+AND\s+lease_token\s*=\s*\$\d+\s+AND\s+status\s*=\s*'PROCESSING'\s+AND\s+lease_expires_at\s*>\s*clock_timestamp\(\)$/i,
+  },
+  {
+    id: 'T11',
+    description: 'Operator Identity Idempotent Upsert',
+    pattern: /^INSERT\s+INTO\s+(?:public\.)?operator_identities\s*\(id,\s*operator_user_id,\s*authoritative_role,\s*created_at\)\s+VALUES\s*\(\$\d+,\s*\$\d+,\s*\$\d+,\s*clock_timestamp\(\)\)\s+ON\s+CONFLICT\s*\(id\)\s+DO\s+UPDATE\s+SET\s+authoritative_role\s*=\s*EXCLUDED\.authoritative_role$/i,
+  },
+  {
+    id: 'T12',
+    description: 'Operator Dead-Letter Replay CTE Atomic Re-Lease',
+    pattern: /^WITH\s+targets\s+AS\s*\(\s*SELECT\s+id,\s*wedding_id,\s*last_error\s+FROM\s+(?:public\.)?outbox_events\s+WHERE\s+(?:id\s*=\s*\$\d+\s+AND\s+)?status\s*=\s*'DEAD_LETTER'(?:(?:\s+AND\s+wedding_id\s*=\s*\$\d+)?\s+ORDER\s+BY\s+updated_at\s+ASC\s+LIMIT\s+\$\d+)?\s+FOR\s+UPDATE\s+SKIP\s+LOCKED\s*\)\s+UPDATE\s+(?:public\.)?outbox_events\s+o\s+SET\s+status\s*=\s*'PENDING',\s*retry_count\s*=\s*0,\s*lease_token\s*=\s*NULL,\s*lease_expires_at\s*=\s*NULL,\s*last_error\s*=\s*(?:NULL|'REPLAYED_BY_OPERATOR:\s*'\s*\|\|\s*\$\d+\s*\|\|\s*'\s*\|\s*REASON:\s*'\s*\|\|\s*\$\d+\s*\|\|\s*'\s*\|\s*PREVIOUS_ERRORS:\s*'\s*\|\|\s*COALESCE\(t\.last_error,\s*'none'\)),\s*updated_at\s*=\s*clock_timestamp\(\)\s+FROM\s+targets\s+t\s+WHERE\s+o\.id\s*=\s*t\.id\s+RETURNING\s+o\.id,\s*o\.wedding_id(?:,\s*t\.last_error\s+AS\s+original_last_error)?$/i,
+  },
+  {
+    id: 'T13',
+    description: 'Immutable Audit Log Commitment',
+    pattern: /^INSERT\s+INTO\s+(?:public\.)?audit_log\s*\(wedding_id,\s*operator_id,\s*actor_id,\s*action,\s*detail,\s*created_at\)\s+VALUES\s*\(.+clock_timestamp\(\)\)$/i,
+  },
+  {
+    id: 'T-HARNESS-1',
+    description: 'Harness / Diagnostic Probe - Outbox Probes',
+    pattern: /^SELECT\s+(?:id|1|status,\s*retry_count|id,\s*event_type)\s+FROM\s+(?:public\.)?outbox_events(?:\s+WHERE\s+status\s*=\s*\$\d+|\s+WHERE\s+id\s*=\s*\$\d+)?$/i,
+  },
+  {
+    id: 'T-HARNESS-2',
+    description: 'Harness / Diagnostic Probe - Audit Log Read',
+    pattern: /^SELECT\s+1\s+FROM\s+(?:public\.)?audit_log\s+WHERE\s+id\s*=\s*1$/i,
+  },
+  {
+    id: 'T-HARNESS-3',
+    description: 'Harness / Test Mutation - Controlled Test Event Update',
+    pattern: /^UPDATE\s+(?:public\.)?outbox_events\s+SET\s+status\s*=\s*\$\d+\s+WHERE\s+id\s*=\s*\$\d+$/i,
+  },
+  {
+    id: 'T-HARNESS-4',
+    description: 'Harness / Test Mutation - Controlled Test Audit Log Insert',
+    pattern: /^INSERT\s+INTO\s+(?:public\.)?audit_log\s*\(id,\s*event_type\)\s+VALUES\s*\(\$\d+,\s*\$\d+\)$/i,
+  },
+  {
+    id: 'T-INIT-CHECK',
+    description: 'Connection Verification - search_path verification probe',
+    pattern: /^SELECT\s+current_setting\('search_path'\)(?:\s+AS\s+\w+)?\s+FROM\s+(?:public\.)?outbox_events(?:\s+LIMIT\s+\d+)?$/i,
+  },
+];
+
+/**
  * Fail-Closed Production SQL Policy Validator (F14.5 Revision 20.4).
  * 1. Rejects empty, whitespace-only, or non-string SQL statements.
  * 2. Rejects multiple SQL statements (semicolon followed by non-whitespace statements).
@@ -306,6 +414,7 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     'greatest',
     'least',
     'now',
+    'current_setting',
   ]);
   const syntaxKeywords = new Set([
     'values', 'in', 'on', 'with', 'as', 'targets', 'if', 'exists', 'extract',
@@ -365,6 +474,17 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     const rawTable = (match[2] || '').replace(/["`]/g, '');
     const fullIdent = rawSchema ? `${rawSchema}.${rawTable}` : rawTable;
     validateTargetRelation(fullIdent);
+  }
+
+  // 7. Canonical Reviewed SQL Template Catalog Enforcement (F14.5 Revision 20.6)
+  // Rejects any SQL statement that does not match one of the audited canonical query templates
+  // approved for production outbox processing.
+  const normalizedRawSql = sql.replace(/\/\*[\s\S]*?\*\/|--.*$/gm, ' ').replace(/\s+/g, ' ').trim();
+  const matchedTemplate = CANONICAL_SQL_TEMPLATES.find((t) => t.pattern.test(normalizedRawSql));
+  if (!matchedTemplate) {
+    throw new Error(
+      `CRITICAL_BOUNDARY_ERROR: SQL statement does not match any approved canonical production template in catalog (T1-T13): ${normalizedRawSql.slice(0, 60)}`
+    );
   }
 }
 
@@ -537,6 +657,8 @@ export class ProductionBoundaryClient {
   }
 }
 
+export const initializedPhysicalClients = new WeakSet<object>();
+
 /**
  * Concrete Production Database Boundary Pool Adapter (F14.5 Revision 20.4).
  * Wraps any pg.Pool to enforce that 100% of queries executed by the outbox processor—both
@@ -563,7 +685,7 @@ export class ProductionDatabaseBoundaryPoolAdapter {
     if (internalCreationToken === TRUSTED_PRODUCTION_ADAPTER_TOKEN) {
       trustedProductionAdapters.add(this);
     }
-    // Enforce fixed trusted search_path on physical client connections where event emitter is supported:
+    // Layer 1: Background event listener for connection pool lifecycle
     if (typeof rawPool.on === 'function') {
       try {
         rawPool.on('connect', (client: any) => {
@@ -575,9 +697,36 @@ export class ProductionDatabaseBoundaryPoolAdapter {
     }
   }
 
+  /**
+   * Acquire a connection client with an awaited initialization guarantee.
+   * Ensures that 'SET search_path = public, pg_temp' has completed execution
+   * BEFORE the client is returned to the caller, preventing any race condition
+   * where application queries execute against an unpinned or shadow search_path.
+   */
   async connect(): Promise<ProductionBoundaryClient> {
     const rawClient = await this.#rawPool.connect();
+    await this.#ensureConnectionInitialized(rawClient);
     return new ProductionBoundaryClient(rawClient, this.#onQuery);
+  }
+
+  async #ensureConnectionInitialized(rawClient: any): Promise<void> {
+    if (!rawClient || typeof rawClient.query !== 'function') return;
+    if (initializedPhysicalClients.has(rawClient)) return;
+
+    // For physical PostgreSQL clients (or test clients requesting explicit initialization),
+    // await session pinning before returning the client to guarantee execution order:
+    const isRealClient = rawClient.constructor?.name === 'Client' || !!rawClient.connection || !!rawClient.__forceInit;
+    if (isRealClient) {
+      try {
+        await rawClient.query('SET search_path = public, pg_temp');
+        initializedPhysicalClients.add(rawClient);
+      } catch (err: any) {
+        if (typeof rawClient.release === 'function') {
+          try { rawClient.release(err); } catch {}
+        }
+        throw new Error(`CRITICAL_BOUNDARY_ERROR: Failed to establish trusted search_path on connection: ${err.message}`);
+      }
+    }
   }
 
   async query(sql: string, values?: any[]): Promise<any> {

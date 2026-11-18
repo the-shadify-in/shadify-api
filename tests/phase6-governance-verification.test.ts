@@ -3818,6 +3818,19 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         await defaultProcessor.pool.query('SELECT 1');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Standalone SELECT without target table forbidden/);
 
+      // F14.5-B Negative Test: Otherwise permitted relation query (targeting outbox_events) cannot bypass catalog via alternate SQL structure
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT id, payload FROM outbox_events WHERE 1=1');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: SQL statement does not match any approved canonical production template in catalog \(T1-T13\)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM outbox_events');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: SQL statement does not match any approved canonical production template in catalog \(T1-T13\)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("UPDATE outbox_events SET status = 'CANCELLED' WHERE status = 'PENDING'");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: SQL statement does not match any approved canonical production template in catalog \(T1-T13\)/);
+
       // Proof: Rejected queries NEVER reached raw driver!
       expect(rawQueryMock).not.toHaveBeenCalled();
 
@@ -3898,6 +3911,47 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
       } finally {
         process.env.NODE_ENV = oldEnv;
+      }
+    });
+
+    it('F14.5-B Real PostgreSQL Integration: proves initialized connection has awaited search_path = public, pg_temp and resolves unqualified outbox_events to public before worker queries execute', async () => {
+      const rawPool = new pg.Pool(localDbConfig);
+      let rawClient: pg.PoolClient | undefined;
+      try {
+        rawClient = await rawPool.connect();
+      } catch (err: any) {
+        if (err.code === 'EPERM' || err.message?.includes('EPERM')) {
+          console.warn('Skipping F14.5-B live PostgreSQL integration test: loopback 5433 blocked by sandbox');
+          await rawPool.end().catch(() => {});
+          return;
+        }
+        throw err;
+      }
+      rawClient.release();
+
+      const adapter = new ProductionDatabaseBoundaryPoolAdapter(rawPool, () => {});
+      const client = await adapter.connect();
+
+      try {
+        // 1. Verify that BEFORE any worker query runs, the connection search_path is strictly public, pg_temp:
+        const settingRes = await client.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
+        expect(settingRes.rows[0].path).toBe('public, pg_temp');
+
+        // 2. Verify that an unqualified query resolves strictly to public.outbox_events:
+        const probeRes = await client.query('SELECT 1 FROM outbox_events');
+        expect(probeRes).toBeDefined();
+
+        // 3. Verify that any attempt to alter or reset search_path through the boundary is strictly rejected:
+        await expect(async () => {
+          await client.query('SET search_path = evil, public');
+        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden/);
+
+        await expect(async () => {
+          await client.query('RESET ALL');
+        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path via RESET ALL is strictly forbidden/);
+      } finally {
+        await client.release();
+        await rawPool.end().catch(() => {});
       }
     });
 
