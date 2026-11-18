@@ -3606,12 +3606,13 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
     });
 
     it('F14.5 Negative Security Suite: enforces production SQL policy, rejects destructive commands, CTE mutations, and blocks untrusted or no-op interceptors', async () => {
+      const rawQueryMock = vi.fn().mockResolvedValue({ rows: [], rowCount: 0 });
       const rawFakePool: any = {
         connect: async () => ({
-          query: async () => ({ rows: [], rowCount: 0 }),
-          release: () => {},
+          query: rawQueryMock,
+          release: vi.fn(),
         }),
-        query: async () => ({ rows: [], rowCount: 0 }),
+        query: rawQueryMock,
       };
 
       // 1. Default interceptor strictly blocks destructive administrative SQL
@@ -3629,7 +3630,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         await defaultProcessor.pool.query('TRUNCATE outbox_events');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden/);
 
-      // 2. Default interceptor strictly blocks unsupported mutation forms (MERGE, COPY)
+      // 2. Default interceptor strictly blocks unsupported mutation forms (MERGE, COPY, CREATE, DELETE)
       await expect(async () => {
         await defaultProcessor.pool.query('MERGE INTO outbox_events USING dual ON 1=1 WHEN MATCHED THEN UPDATE SET status = 1');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden/);
@@ -3638,30 +3639,81 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         await defaultProcessor.pool.query('COPY outbox_events FROM stdin');
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden/);
 
-      // 3. Default interceptor strictly blocks direct mutations of photos table (including alternate schema qualification)
+      await expect(async () => {
+        await defaultProcessor.pool.query('CREATE TABLE evil (id int)');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden/);
+
+      // 3. Default interceptor strictly blocks multiple statements (semicolon injection)
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT 1 FROM outbox_events; DROP TABLE public.photos;');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Multiple SQL statements forbidden through boundary/);
+
+      // 4. Default interceptor strictly blocks any query referencing photos in ANY schema qualification
       await expect(async () => {
         await defaultProcessor.pool.query('UPDATE photos SET status = 1');
-      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Direct or CTE mutation of photos table forbidden/);
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
 
       await expect(async () => {
         await defaultProcessor.pool.query('UPDATE "public"."photos" SET status = 1');
-      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Direct or CTE mutation of photos table forbidden/);
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query("UPDATE private.photos SET status = 'x'");
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('UPDATE "custom_schema"."photos" SET status = 1');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
 
       await expect(async () => {
         const cl = await defaultProcessor.pool.connect();
         await cl.query('DELETE FROM public.photos WHERE id = 1');
-      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Direct or CTE mutation of photos table forbidden/);
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden/);
 
-      // 4. Default interceptor strictly blocks CTE-based mutations targeting photos
+      // 5. Default interceptor strictly blocks CTE-based mutations and reads referencing photos
       await expect(async () => {
         await defaultProcessor.pool.query('WITH deleted AS (SELECT 1) DELETE FROM photos WHERE id = 1');
-      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Direct or CTE mutation of photos table forbidden/);
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Destructive administrative or unsupported SQL forbidden|photos table reference)/);
 
       await expect(async () => {
         await defaultProcessor.pool.query('WITH updated AS (SELECT 1) UPDATE "public"."photos" SET status = 1');
-      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Direct or CTE mutation of photos table forbidden/);
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
 
-      // 5. In production runtime, passing a no-op interceptor CANNOT bypass SQL policy
+      await expect(async () => {
+        await defaultProcessor.pool.query(`
+          WITH target AS (
+            SELECT id FROM public.photos
+          )
+          DELETE FROM public.photos
+          WHERE id IN (SELECT id FROM target)
+        `);
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: (Destructive administrative or unsupported SQL forbidden|photos table reference)/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('WITH target AS (SELECT id FROM private.photos) UPDATE outbox_events SET status = 1');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
+
+      // 6. Default interceptor strictly blocks queries targeting unauthorized tables
+      await expect(async () => {
+        await defaultProcessor.pool.query('SELECT * FROM weddings WHERE id = 1');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'weddings' forbidden/);
+
+      await expect(async () => {
+        await defaultProcessor.pool.query('UPDATE users SET name = "attacker"');
+      }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'users' forbidden/);
+
+      // Proof: Rejected queries NEVER reached raw driver!
+      expect(rawQueryMock).not.toHaveBeenCalled();
+
+      // 7. Legitimate outbox operations pass cleanly through the boundary
+      await defaultProcessor.pool.query('BEGIN');
+      await defaultProcessor.pool.query('SELECT id, event_type FROM outbox_events WHERE status = $1', ['PENDING']);
+      await defaultProcessor.pool.query('UPDATE outbox_events SET status = $1 WHERE id = $2', ['PROCESSING', 1]);
+      await defaultProcessor.pool.query('INSERT INTO audit_log (id, event_type) VALUES ($1, $2)', ['a1', 'REVOKE']);
+      await defaultProcessor.pool.query('COMMIT');
+      expect(rawQueryMock).toHaveBeenCalledTimes(5);
+
+      // 8. In production runtime, passing a no-op interceptor CANNOT bypass SQL policy
       const oldEnv = process.env.NODE_ENV;
       try {
         process.env.NODE_ENV = 'production';
@@ -3681,7 +3733,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         // Assert the factory-created adapter is trusted:
         expect(isTrustedProductionAdapter(prodProcessor.pool)).toBe(true);
 
-        // 6. Untrusted caller-created pre-wrapped adapter is strictly rejected in production
+        // 9. Untrusted caller-created pre-wrapped adapter is strictly rejected in production
         const callerCreatedUntrustedAdapter = new ProductionDatabaseBoundaryPoolAdapter(rawFakePool, noopInterceptor);
         expect(isTrustedProductionAdapter(callerCreatedUntrustedAdapter)).toBe(false);
 
@@ -3693,7 +3745,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
           });
         }).toThrow(/CRITICAL_CONFIG_ERROR: Untrusted caller-created ProductionDatabaseBoundaryPoolAdapter rejected in production/);
 
-        // 7. Pre-wrapped adapter cannot be overridden with custom interceptor in production
+        // 10. Pre-wrapped adapter cannot be overridden with custom interceptor in production
         expect(() => {
           createProductionOutboxProcessor({
             pool: prodProcessor.pool as any,
@@ -3705,6 +3757,105 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       } finally {
         process.env.NODE_ENV = oldEnv;
       }
+    });
+
+    it('F15.5 Production Connection Lifecycle: proves production client auto-rollback, rollback failure destruction, idempotent release, and error preservation', async () => {
+      const mockRawClient = {
+        query: vi.fn(),
+        release: vi.fn(),
+      };
+      const mockPool = {
+        connect: async () => mockRawClient,
+        query: vi.fn(),
+      };
+
+      const adapter = new ProductionDatabaseBoundaryPoolAdapter(mockPool, () => {});
+
+      // 1. Normal clean release when no transaction was opened
+      const client1 = await adapter.connect();
+      expect(client1.isInTransaction()).toBe(false);
+      await client1.release();
+      expect(mockRawClient.release).toHaveBeenCalledTimes(1);
+
+      // 2. Idempotent release: repeated calls await the same shared promise and release raw client at most once
+      await client1.release();
+      await client1.release();
+      expect(mockRawClient.release).toHaveBeenCalledTimes(1); // STILL 1!
+
+      // 3. Auto-rollback on release when transaction left in-flight
+      mockRawClient.release.mockClear();
+      mockRawClient.query.mockClear();
+      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // BEGIN query
+      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // ROLLBACK on release
+
+      const client2 = await adapter.connect();
+      await client2.query('BEGIN');
+      expect(client2.isInTransaction()).toBe(true);
+
+      await client2.release();
+      expect(mockRawClient.query).toHaveBeenCalledWith('ROLLBACK');
+      expect(client2.isInTransaction()).toBe(false);
+      expect(mockRawClient.release).toHaveBeenCalledWith(); // Clean release back to pool
+
+      // 4. Rollback failure causes immediate connection destruction via rawClient.release(err)
+      mockRawClient.release.mockClear();
+      mockRawClient.query.mockClear();
+      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // BEGIN query
+      const simulatedRollbackError = new Error('DATABASE_CONNECTION_RESET_DURING_ROLLBACK');
+      mockRawClient.query.mockRejectedValueOnce(simulatedRollbackError); // ROLLBACK throws!
+
+      const client3 = await adapter.connect();
+      await client3.query('BEGIN');
+
+      await expect(client3.release()).rejects.toThrow(
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed/
+      );
+
+      expect(client3.isDiscarded()).toBe(true);
+      expect(client3.isInTransaction()).toBe(false);
+      expect(client3.getRollbackError()).toBe(simulatedRollbackError);
+      // Critically: rawClient.release was called with the error to destroy connection socket!
+      expect(mockRawClient.release).toHaveBeenCalledWith(simulatedRollbackError);
+
+      // 5. Repeated release after failure returns the same rejected promise without re-releasing
+      await expect(client3.release()).rejects.toThrow(
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed/
+      );
+      expect(mockRawClient.release).toHaveBeenCalledTimes(1); // STILL 1!
+
+      // 6. Attempting to query on destroyed client throws fail-closed
+      await expect(client3.query('SELECT 1 FROM outbox_events')).rejects.toThrow(
+        /CRITICAL_BOUNDARY_ERROR: Cannot query on destroyed connection client/
+      );
+    });
+
+    it('F15.5 Production Worker Error Handling: processBatch propagates combined error on rollback failure and preserves processing error across cleanup', async () => {
+      const mockRawClient = {
+        query: vi.fn(),
+        release: vi.fn(),
+      };
+      const mockPool = {
+        connect: async () => mockRawClient,
+        query: vi.fn(),
+      };
+
+      const processor = createProductionOutboxProcessor({
+        pool: mockPool,
+        doCoordinator: { revokePhoto: async () => {} } as any,
+        strictRevocationMode: false,
+      });
+
+      // 1. When leasing query fails AND rollback fails:
+      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      mockRawClient.query.mockRejectedValueOnce(new Error('SIMULATED_QUERY_DEADLOCK')); // SELECT FOR UPDATE fails
+      mockRawClient.query.mockRejectedValueOnce(new Error('SIMULATED_ROLLBACK_SOCKET_CLOSED')); // ROLLBACK fails
+
+      await expect(processor.processBatch(10)).rejects.toThrow(
+        /PROCESSING_ERROR: SIMULATED_QUERY_DEADLOCK \| ROLLBACK_FAILED: SIMULATED_ROLLBACK_SOCKET_CLOSED/
+      );
+
+      // Verify cleanup was still awaited in finally
+      expect(mockRawClient.release).toHaveBeenCalled();
     });
 
     it('F15.5 (Mocked Unit Test) Two-Worker processBatch fencing logic: in-memory state simulation of lease expiration, stale worker rejection, and idempotent completion', async () => {

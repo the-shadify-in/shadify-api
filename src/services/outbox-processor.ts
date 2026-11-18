@@ -218,29 +218,88 @@ export function isTrustedProductionAdapter(pool: any): boolean {
 }
 
 /**
- * Enforces production SQL query policies and invariants (F14.5 Revision 20.3):
+ * Fail-Closed Production SQL Policy Validator (F14.5 Revision 20.4).
  * 1. Rejects empty, whitespace-only, or non-string SQL statements.
- * 2. Rejects destructive administrative SQL commands (DROP, TRUNCATE, ALTER, GRANT, REVOKE)
- *    and unsupported mutation forms (MERGE, COPY, CREATE, PREPARE, EXECUTE).
- * 3. Enforces boundary isolation: forbids any mutation of the photos table from outbox workers,
- *    including CTEs (WITH ... DELETE/UPDATE), alternate schema qualifications ("public"."photos"),
- *    and unquoted/quoted identifiers.
+ * 2. Rejects multiple SQL statements (semicolon followed by non-whitespace statements).
+ * 3. Strictly forbids any query referencing the photos table in ANY schema qualification
+ *    (e.g., photos, public.photos, private.photos, "photos", etc.), whether direct, joined, or via CTE.
+ * 4. Rejects all destructive administrative commands (DROP, TRUNCATE, ALTER, GRANT, REVOKE)
+ *    and unsupported commands (MERGE, COPY, CREATE, EXECUTE, PREPARE, DELETE, CALL, DO, VACUUM).
+ * 5. Strictly allowlists permitted query operations:
+ *    - Transaction management: BEGIN, START TRANSACTION, COMMIT, END, ROLLBACK, ABORT
+ *    - Session timeout: SET LOCAL lock_timeout ...
+ *    - Outbox queries: SELECT ... FROM outbox_events, UPDATE outbox_events ...
+ *    - Replay CTE: WITH targets AS (SELECT id, ... FROM outbox_events ...) UPDATE outbox_events ...
+ *    - Audit log: INSERT INTO audit_log ...
+ *    Any query targeting unauthorized tables or unpermitted syntax fails closed.
  */
 export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
   if (typeof sql !== 'string' || sql.trim().length === 0) {
     throw new Error('CRITICAL_BOUNDARY_ERROR: Empty or non-string SQL submitted to production database boundary');
   }
+
+  // Normalize comments and string literals
   const cleanSql = sql
     .replace(/\/\*[\s\S]*?\*\/|--.*$/gm, ' ')
     .replace(/'(?:''|[^'])*'/g, "''")
     .trim();
-  const upper = cleanSql.toUpperCase();
-  if (/^(DROP|TRUNCATE|ALTER|GRANT|REVOKE|MERGE|COPY|CREATE|EXECUTE|PREPARE)\b/.test(upper)) {
+
+  // 1. Multiple statement rejection:
+  const statements = cleanSql.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
+  if (statements.length > 1) {
+    throw new Error('CRITICAL_BOUNDARY_ERROR: Multiple SQL statements forbidden through boundary');
+  }
+
+  const singleStmt = statements[0] || cleanSql;
+  const upper = singleStmt.toUpperCase();
+
+  // 2. Reject destructive administrative and unsupported mutation commands:
+  if (/^(DROP|TRUNCATE|ALTER|GRANT|REVOKE|MERGE|COPY|CREATE|EXECUTE|PREPARE|DELETE|CALL|DO|VACUUM|ANALYZE|REINDEX|EXPLAIN)\b/.test(upper)) {
     throw new Error(`CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden through boundary: ${upper.slice(0, 30)}`);
   }
-  const photosMutationPattern = /\b(INSERT\s+INTO|UPDATE|DELETE(\s+FROM)?)\s+(["`]?public["`]?\.)?["`]?photos["`]?\b/i;
-  if (photosMutationPattern.test(cleanSql)) {
-    throw new Error('CRITICAL_BOUNDARY_ERROR: Direct or CTE mutation of photos table forbidden through outbox boundary');
+
+  // 3. Reject any query mentioning photos table in ANY schema (e.g. photos, public.photos, private.photos, "photos"):
+  if (/\b(?:["`]?\w+["`]?\.)?["`]?photos["`]?\b/i.test(singleStmt)) {
+    throw new Error('CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden through outbox boundary');
+  }
+
+  // 4. Strict allowlist check:
+  // Transaction control and session commands
+  if (/^(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT)\b/.test(upper)) {
+    return;
+  }
+  if (/^SET\s+LOCAL\s+lock_timeout\b/i.test(singleStmt)) {
+    return;
+  }
+
+  // Allowed data operations must target only outbox_events or audit_log
+  const isAllowedCommand = /^(SELECT|UPDATE|INSERT\s+INTO|WITH\s+targets\s+AS)\b/i.test(singleStmt);
+  if (!isAllowedCommand) {
+    throw new Error(`CRITICAL_BOUNDARY_ERROR: Unsupported SQL command forbidden through boundary: ${upper.slice(0, 30)}`);
+  }
+
+  // Strip FOR UPDATE locking clauses and ON CONFLICT DO UPDATE clauses before checking table targets
+  const withoutLockingClause = singleStmt
+    .replace(/\bFOR\s+UPDATE(\s+(?:NOWAIT|SKIP\s+LOCKED))?\b/gi, ' ')
+    .replace(/\bDO\s+UPDATE\s+SET\b/gi, ' ');
+
+  // Extract all table identifiers referenced in FROM, JOIN, UPDATE, INTO, TABLE
+  const tableTargetMatches = withoutLockingClause.matchAll(/\b(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+(["`]?\w+["`]?\.)?(["`]?\w+["`]?)/gi);
+  for (const match of tableTargetMatches) {
+    const rawTable = (match[2] || '').replace(/["`]/g, '').toLowerCase();
+    const rawSchema = (match[1] || '').replace(/[".`]/g, '').toLowerCase();
+
+    // Permitted targets: outbox_events, audit_log, operator_identities, and local CTE aliases (targets, dual)
+    const isPermittedTarget =
+      rawTable === 'outbox_events' ||
+      rawTable === 'audit_log' ||
+      rawTable === 'operator_identities' ||
+      rawTable === 'targets' ||
+      rawTable === 'dual';
+
+    if (!isPermittedTarget) {
+      throw new Error(`CRITICAL_BOUNDARY_ERROR: Unauthorized table target '${rawSchema ? rawSchema + '.' : ''}${rawTable}' forbidden through outbox boundary`);
+    }
   }
 }
 
@@ -253,7 +312,127 @@ export const defaultProductionBoundaryInterceptor: QueryInterceptorHook = (
 };
 
 /**
- * Concrete Production Database Boundary Pool Adapter (F14.5 Revision 20.3).
+ * Production Boundary Client Wrapper (F14.5 & F15.5 Revision 20.4).
+ * Wraps checked-out pg client instances in production to enforce:
+ * 1. Fail-closed query interception via assertProductionSqlPolicy.
+ * 2. Real-time transaction state tracking (inTransaction).
+ * 3. Awaited rollback on release when a transaction is left in-flight.
+ * 4. Immediate connection destruction via rawClient.release(err) on rollback failure (uncertain socket state).
+ * 5. Idempotent release using a single shared promise (raw connection released at most once).
+ * 6. Error preservation: preserves rollback error without losing diagnostic context.
+ */
+export class ProductionBoundaryClient {
+  #rawClient: any;
+  #onQuery: QueryInterceptorHook;
+  #inTransaction: boolean = false;
+  #isDestroyed: boolean = false;
+  #rollbackError: Error | null = null;
+  #releasePromise: Promise<void> | null = null;
+
+  constructor(rawClient: any, onQuery: QueryInterceptorHook) {
+    this.#rawClient = rawClient;
+    this.#onQuery = onQuery;
+  }
+
+  isInTransaction(): boolean {
+    return this.#inTransaction;
+  }
+
+  isDiscarded(): boolean {
+    return this.#isDestroyed;
+  }
+
+  getRollbackError(): Error | null {
+    return this.#rollbackError;
+  }
+
+  async query(sql: string, values?: any[]): Promise<any> {
+    if (this.#isDestroyed) {
+      throw new Error('CRITICAL_BOUNDARY_ERROR: Cannot query on destroyed connection client');
+    }
+    if (this.#releasePromise) {
+      throw new Error('CRITICAL_BOUNDARY_ERROR: Cannot query on released connection client');
+    }
+
+    // Fail-closed policy validation before executing query
+    assertProductionSqlPolicy(sql, values);
+    await this.#onQuery('client.query', sql, values);
+
+    const cleanSql = sql
+      .replace(/\/\*[\s\S]*?\*\/|--.*$/gm, ' ')
+      .replace(/'(?:''|[^'])*'/g, "''")
+      .trim();
+    const upper = cleanSql.toUpperCase();
+
+    try {
+      const res = await this.#rawClient.query(sql, values);
+      if (/^(BEGIN|START\s+TRANSACTION)\b/.test(upper)) {
+        this.#inTransaction = true;
+      } else if (/^(COMMIT|END|ROLLBACK|ABORT)\b/.test(upper)) {
+        this.#inTransaction = false;
+      }
+      return res;
+    } catch (err) {
+      if (/^(ROLLBACK|ABORT)\b/.test(upper)) {
+        this.#inTransaction = false;
+        this.#isDestroyed = true;
+        this.#rollbackError = err instanceof Error ? err : new Error(String(err));
+        if (typeof this.#rawClient.release === 'function') {
+          this.#rawClient.release(err);
+        }
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Idempotent client release using shared promise memoization.
+   * If a transaction is in-flight, strictly awaits ROLLBACK.
+   * On rollback failure, marks connection destroyed and instructs pg-pool to discard & destroy physical socket.
+   */
+  release(): Promise<void> {
+    if (this.#releasePromise) {
+      return this.#releasePromise;
+    }
+    this.#releasePromise = this.#performRelease();
+    return this.#releasePromise;
+  }
+
+  async #performRelease(): Promise<void> {
+    if (this.#inTransaction) {
+      try {
+        await this.#rawClient.query('ROLLBACK');
+        this.#inTransaction = false;
+        if (typeof this.#rawClient.release === 'function') {
+          this.#rawClient.release(); // Clean release back to pool
+        }
+      } catch (err: any) {
+        this.#isDestroyed = true;
+        this.#inTransaction = false;
+        this.#rollbackError = err instanceof Error ? err : new Error(String(err));
+        if (typeof this.#rawClient.release === 'function') {
+          try {
+            this.#rawClient.release(err); // Instruct pg-pool to discard and destroy the physical socket
+          } catch (relErr) {
+            console.error('Secondary error during client.release(err):', relErr);
+          }
+        } else if (typeof this.#rawClient.destroy === 'function') {
+          try {
+            this.#rawClient.destroy();
+          } catch {}
+        }
+        throw new Error(`CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed: ${err?.message || err}`);
+      }
+    } else {
+      if (typeof this.#rawClient.release === 'function') {
+        this.#rawClient.release();
+      }
+    }
+  }
+}
+
+/**
+ * Concrete Production Database Boundary Pool Adapter (F14.5 Revision 20.4).
  * Wraps any pg.Pool to enforce that 100% of queries executed by the outbox processor—both
  * checked-out client connections and direct pooled queries—pass through mandatory boundary interception.
  * Uses ECMAScript private fields (#rawPool, #onQuery) to guarantee zero runtime reflection or bypass.
@@ -276,22 +455,13 @@ export class ProductionDatabaseBoundaryPoolAdapter {
     }
   }
 
-  async connect(): Promise<{ query: (sql: string, values?: any[]) => Promise<any>; release: () => Promise<void> }> {
+  async connect(): Promise<ProductionBoundaryClient> {
     const rawClient = await this.#rawPool.connect();
-    return {
-      query: async (sql: string, values?: any[]) => {
-        await this.#onQuery('client.query', sql, values);
-        return await rawClient.query(sql, values);
-      },
-      release: async () => {
-        if (typeof rawClient.release === 'function') {
-          await rawClient.release();
-        }
-      },
-    };
+    return new ProductionBoundaryClient(rawClient, this.#onQuery);
   }
 
   async query(sql: string, values?: any[]): Promise<any> {
+    assertProductionSqlPolicy(sql, values);
     await this.#onQuery('pool.query', sql, values);
     return await this.#rawPool.query(sql, values);
   }
@@ -593,10 +763,11 @@ export class OutboxRevocationProcessor {
     let deadLetterCount = 0;
 
     let leasedEvents: { row: any; leaseToken: string }[] = [];
+    let processingError: any = null;
     try {
       try {
         // 1. Atomically lease pending or expired-lease events using row locking
-      await client.query('BEGIN');
+        await client.query('BEGIN');
       const queryParams: any[] = [batchSize];
       let filterClause = '';
       if (this.targetWeddingId) {
@@ -648,7 +819,14 @@ export class OutboxRevocationProcessor {
     } catch (leaseErr) {
       try {
         await client.query('ROLLBACK');
-      } catch {}
+      } catch (rollbackErr: any) {
+        const combined = new Error(
+          `PROCESSING_ERROR: ${leaseErr?.message || leaseErr} | ROLLBACK_FAILED: ${rollbackErr?.message || rollbackErr}`
+        );
+        (combined as any).originalError = leaseErr;
+        (combined as any).rollbackError = rollbackErr;
+        throw combined;
+      }
       throw leaseErr;
     }
 
@@ -851,8 +1029,20 @@ export class OutboxRevocationProcessor {
           }
         }
       }
+    } catch (err: any) {
+      processingError = err;
+      throw err;
     } finally {
-      await client.release();
+      try {
+        await client.release();
+      } catch (cleanupErr: any) {
+        if (processingError) {
+          console.error('CRITICAL: Cleanup failure following processing error:', cleanupErr);
+          (processingError as any).cleanupError = cleanupErr;
+          throw processingError;
+        }
+        throw cleanupErr;
+      }
     }
 
     return {
