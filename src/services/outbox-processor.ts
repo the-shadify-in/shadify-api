@@ -276,15 +276,17 @@ export class ProductionDatabaseBoundaryPoolAdapter {
     }
   }
 
-  async connect(): Promise<{ query: (sql: string, values?: any[]) => Promise<any>; release: () => void }> {
+  async connect(): Promise<{ query: (sql: string, values?: any[]) => Promise<any>; release: () => Promise<void> }> {
     const rawClient = await this.#rawPool.connect();
     return {
       query: async (sql: string, values?: any[]) => {
         await this.#onQuery('client.query', sql, values);
         return await rawClient.query(sql, values);
       },
-      release: () => {
-        rawClient.release();
+      release: async () => {
+        if (typeof rawClient.release === 'function') {
+          await rawClient.release();
+        }
       },
     };
   }
@@ -850,7 +852,7 @@ export class OutboxRevocationProcessor {
         }
       }
     } finally {
-      client.release();
+      await client.release();
     }
 
     return {
@@ -1046,7 +1048,7 @@ export class OutboxRevocationProcessor {
       throw err;
     } finally {
       if (typeof client.release === 'function') {
-        client.release();
+        await client.release();
       }
     }
   }
