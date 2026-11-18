@@ -25,6 +25,8 @@ import {
   ProductionDatabaseBoundaryPoolAdapter,
   isTrustedProductionAdapter,
   assertProductionSqlPolicy,
+  tokenizeAndStripSqlComments,
+  splitSqlStatements,
 } from '../src/services/outbox-processor.js';
 import {
   EdgeCdnHandler,
@@ -4017,6 +4019,119 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }
     });
 
+    it('F14.5-B Adversarial SQL Normalization & Tokenizer Security Suite: proves comment characters inside literals/identifiers are preserved and cannot mask multi-statement injection', async () => {
+      // 1. Line comment inside single-quoted string literal is preserved as string content
+      const sqlWithLineCommentInLiteral = "SELECT id, event_type FROM outbox_events WHERE status = 'PENDING -- not comment'";
+      const tokenized1 = tokenizeAndStripSqlComments(sqlWithLineCommentInLiteral);
+      expect(tokenized1).toContain("'PENDING -- not comment'");
+      expect(splitSqlStatements(sqlWithLineCommentInLiteral)).toHaveLength(1);
+
+      // 2. Block comment inside single-quoted string literal is preserved as string content
+      const sqlWithBlockCommentInLiteral = "SELECT id, event_type FROM outbox_events WHERE status = 'PENDING /* not comment */'";
+      const tokenized2 = tokenizeAndStripSqlComments(sqlWithBlockCommentInLiteral);
+      expect(tokenized2).toContain("'PENDING /* not comment */'");
+      expect(splitSqlStatements(sqlWithBlockCommentInLiteral)).toHaveLength(1);
+
+      // 3. Escaped single quotes with comment markers are preserved within literal
+      const sqlWithEscapedQuote = "SELECT id, event_type FROM outbox_events WHERE status = 'it''s -- note'";
+      const tokenized3 = tokenizeAndStripSqlComments(sqlWithEscapedQuote);
+      expect(tokenized3).toContain("'it''s -- note'");
+      expect(splitSqlStatements(sqlWithEscapedQuote)).toHaveLength(1);
+
+      // 4. Dollar-quoted string containing semicolons and comment markers is preserved as single literal
+      const dollar = String.fromCharCode(36, 36);
+      const sqlWithDollarQuote = `SELECT id, event_type FROM outbox_events WHERE status = ${dollar}-- not comment; DROP TABLE photos; /* block */${dollar}`;
+      const tokenized4 = tokenizeAndStripSqlComments(sqlWithDollarQuote);
+      expect(tokenized4).toContain(`${dollar}-- not comment; DROP TABLE photos; /* block */${dollar}`);
+      expect(splitSqlStatements(sqlWithDollarQuote)).toHaveLength(1);
+
+      // 5. Quoted identifiers containing comment syntax are preserved verbatim
+      const sqlWithQuotedIdent = 'SELECT "id", "event_type" FROM "outbox_events" WHERE "status" = $1';
+      const tokenized5 = tokenizeAndStripSqlComments(sqlWithQuotedIdent);
+      expect(tokenized5).toBe('SELECT "id", "event_type" FROM "outbox_events" WHERE "status" = $1');
+
+      // 6. Multi-statement injection attempt using comment-like quotes:
+      // An attacker attempts to hide a second statement by crafting:
+      // UPDATE outbox_events SET status = '/* '; DROP TABLE users; -- */'
+      // The tokenizer detects the closing quote after '/* ', finds the ';' outside literals,
+      // and splitSqlStatements detects multiple statements fail-closed:
+      const maliciousMultiStmt = "UPDATE outbox_events SET status = '/* '; DROP TABLE users; -- */";
+      const stmts = splitSqlStatements(maliciousMultiStmt);
+      expect(stmts.length).toBeGreaterThan(1);
+      expect(() => {
+        assertProductionSqlPolicy(maliciousMultiStmt);
+      }).toThrow(/CRITICAL_BOUNDARY_ERROR: Multiple SQL statements forbidden through boundary/);
+
+      // 7. Real comments outside strings are safely stripped, including nested block comments:
+      const realCommentSql = 'SELECT id, event_type /* outer /* inner */ still */ FROM outbox_events WHERE status = $1 -- trailing';
+      const tokenizedReal = tokenizeAndStripSqlComments(realCommentSql);
+      expect(tokenizedReal).toBe('SELECT id, event_type FROM outbox_events WHERE status = $1');
+      expect(() => {
+        assertProductionSqlPolicy(realCommentSql);
+      }).not.toThrow();
+
+      // 8. Prove that no SQL statement with a different executable structure can normalize into an approved template:
+      // Structural variation targeting forbidden table 'users' with comments interleaved:
+      const spoofAttempt = 'SELECT /* safe */ * /* bypass */ FROM /* comment */ users';
+      expect(() => {
+        assertProductionSqlPolicy(spoofAttempt);
+      }).toThrow(/CRITICAL_BOUNDARY_ERROR: Unauthorized table target 'users' forbidden/);
+    });
+
+    it('F14.5-B Malformed Acquired Client Resource-Leak Prevention: proves malformed connection is released and not leaked when missing query interface', async () => {
+      const mockMalformedClient = {
+        release: vi.fn(),
+        // missing query() interface!
+      };
+      const mockPool = {
+        connect: async () => mockMalformedClient,
+        query: vi.fn(),
+      };
+      const adapter = new ProductionDatabaseBoundaryPoolAdapter(mockPool, () => {});
+
+      await expect(adapter.connect()).rejects.toThrow(
+        /CRITICAL_BOUNDARY_ERROR: Acquired connection client does not implement query\(\) interface/
+      );
+
+      // Crucial assertion: the malformed client's release method was invoked so pool resources are not leaked!
+      expect(mockMalformedClient.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('F14.5-B Connection Reuse & Unconditional Re-initialization: proves reacquired physical client is unconditionally sanitized if tainted between checkouts', async () => {
+      const pool = new pg.Pool({ ...localDbConfig, max: 1 });
+      const adapter = new ProductionDatabaseBoundaryPoolAdapter(pool, () => {});
+
+      try {
+        // 1. Initial checkout through adapter: session is pinned to public, pg_temp
+        const client1 = await adapter.connect();
+        const check1 = await client1.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
+        expect(check1.rows[0].path).toBe('public, pg_temp');
+        await client1.release(); // Releases physical client back to pool
+
+        // 2. Simulate another code path acquiring the physical connection directly from raw pool and mutating session:
+        const rawClient = await pool.connect();
+        await rawClient.query('SET search_path = pg_catalog, pg_temp');
+        const taintedSetting = await rawClient.query("SELECT current_setting('search_path') AS path");
+        expect(taintedSetting.rows[0].path).toBe('pg_catalog, pg_temp');
+        rawClient.release(); // Releases tainted physical client back to pool
+
+        // 3. Adapter reacquires connection from pool: unconditionally executes 'SET search_path = public, pg_temp'
+        const client2 = await adapter.connect();
+        const check2 = await client2.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
+        expect(check2.rows[0].path).toBe('public, pg_temp'); // Fully restored & sanitized!
+        await client2.release();
+      } catch (err: any) {
+        if (err.code === 'ECONNREFUSED' || err.code === 'EPERM') {
+          throw new Error(
+            `CRITICAL_RELEASE_GATE_VERIFICATION_FAILURE: Live PostgreSQL on port 5433 required for F14.5-B verification is unavailable: ${err.message}`
+          );
+        }
+        throw err;
+      } finally {
+        await pool.end().catch(() => {});
+      }
+    });
+
     it('F15.5 Production Connection Lifecycle: proves production client auto-rollback, rollback failure destruction, idempotent release, and error preservation', async () => {
       const mockRawClient = {
         query: vi.fn(),
@@ -4042,9 +4157,9 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
 
       // 3. Auto-rollback on release when transaction left in-flight
       mockRawClient.release.mockClear();
-      mockRawClient.query.mockClear();
-      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // BEGIN query
-      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // ROLLBACK on release
+      mockRawClient.query = vi.fn().mockImplementation(async (sql: string) => {
+        return { rows: [] };
+      });
 
       const client2 = await adapter.connect();
       await client2.query('BEGIN');
@@ -4057,10 +4172,11 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
 
       // 4. Rollback failure causes immediate connection destruction via rawClient.release(err)
       mockRawClient.release.mockClear();
-      mockRawClient.query.mockClear();
-      mockRawClient.query.mockResolvedValueOnce({ rows: [] }); // BEGIN query
       const simulatedRollbackError = new Error('DATABASE_CONNECTION_RESET_DURING_ROLLBACK');
-      mockRawClient.query.mockRejectedValueOnce(simulatedRollbackError); // ROLLBACK throws!
+      mockRawClient.query = vi.fn().mockImplementation(async (sql: string) => {
+        if (sql === 'ROLLBACK') throw simulatedRollbackError;
+        return { rows: [] };
+      });
 
       const client3 = await adapter.connect();
       await client3.query('BEGIN');

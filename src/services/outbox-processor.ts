@@ -345,6 +345,250 @@ const HARNESS_TEST_SQL_TEMPLATES: ReadonlyArray<{
 ]);
 
 /**
+ * PostgreSQL-Aware SQL Comment Stripper & Token Normalizer (F14.5 Revision 20.8).
+ * Safely strips comments (-- line comments and /* ... *\/ block comments, including nested block comments)
+ * ONLY when they occur outside of string literals, dollar-quoted blocks, and quoted identifiers.
+ * Guarantees that '--', '/*', and ';' inside literals or identifiers are preserved verbatim and
+ * never misclassified as comments or statement boundaries.
+ */
+export function tokenizeAndStripSqlComments(sql: string): string {
+  let result = '';
+  let i = 0;
+  const len = sql.length;
+
+  while (i < len) {
+    const ch = sql[i];
+    const next = i + 1 < len ? sql[i + 1] : '';
+
+    // 1. Single-quoted string literal: '...'
+    if (ch === "'") {
+      result += ch;
+      i++;
+      while (i < len) {
+        const c = sql[i];
+        result += c;
+        if (c === "'") {
+          // Check for escaped quote ''
+          if (i + 1 < len && sql[i + 1] === "'") {
+            result += sql[i + 1];
+            i += 2;
+            continue;
+          }
+          i++;
+          break; // end of string literal
+        } else if (c === '\\' && i + 1 < len) {
+          result += sql[i + 1];
+          i += 2;
+          continue;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // 2. Double-quoted identifier: "..."
+    if (ch === '"') {
+      result += ch;
+      i++;
+      while (i < len) {
+        const c = sql[i];
+        result += c;
+        if (c === '"') {
+          // Check for escaped quote ""
+          if (i + 1 < len && sql[i + 1] === '"') {
+            result += sql[i + 1];
+            i += 2;
+            continue;
+          }
+          i++;
+          break; // end of quoted identifier
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // 3. Dollar-quoted string literal: $tag$...$tag$ or $$...$$
+    if (ch === '$' && (next === '$' || /^[a-zA-Z_0-9]/.test(next))) {
+      const match = sql.slice(i).match(/^\$([a-zA-Z_0-9]*)\$/);
+      if (match) {
+        const tag = match[0];
+        result += tag;
+        i += tag.length;
+        const closeIdx = sql.indexOf(tag, i);
+        if (closeIdx !== -1) {
+          result += sql.slice(i, closeIdx + tag.length);
+          i = closeIdx + tag.length;
+        } else {
+          result += sql.slice(i);
+          i = len;
+        }
+        continue;
+      }
+    }
+
+    // 4. Line comment: -- ... until \n or EOF
+    if (ch === '-' && next === '-') {
+      i += 2;
+      while (i < len && sql[i] !== '\n') {
+        i++;
+      }
+      result += ' '; // replace comment with single space
+      continue;
+    }
+
+    // 5. Block comment: /* ... */ with support for PostgreSQL nested block comments
+    if (ch === '/' && next === '*') {
+      i += 2;
+      let depth = 1;
+      while (i < len && depth > 0) {
+        if (sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sql[i] === '*' && i + 1 < len && sql[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      result += ' '; // replace comment with single space
+      continue;
+    }
+
+    // Normal character
+    result += ch;
+    i++;
+  }
+
+  return result.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * PostgreSQL-Aware Statement Splitter (F14.5 Revision 20.8).
+ * Splits multiple SQL statements on ';' boundaries ONLY when ';' occurs outside of
+ * string literals, dollar-quoted blocks, quoted identifiers, and comments.
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = '';
+  let i = 0;
+  const len = sql.length;
+
+  while (i < len) {
+    const ch = sql[i];
+    const next = i + 1 < len ? sql[i + 1] : '';
+
+    if (ch === "'") {
+      current += ch;
+      i++;
+      while (i < len) {
+        const c = sql[i];
+        current += c;
+        if (c === "'") {
+          if (i + 1 < len && sql[i + 1] === "'") {
+            current += sql[i + 1];
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        } else if (c === '\\' && i + 1 < len) {
+          current += sql[i + 1];
+          i += 2;
+          continue;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      current += ch;
+      i++;
+      while (i < len) {
+        const c = sql[i];
+        current += c;
+        if (c === '"') {
+          if (i + 1 < len && sql[i + 1] === '"') {
+            current += sql[i + 1];
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === '$' && (next === '$' || /^[a-zA-Z_0-9]/.test(next))) {
+      const match = sql.slice(i).match(/^\$([a-zA-Z_0-9]*)\$/);
+      if (match) {
+        const tag = match[0];
+        current += tag;
+        i += tag.length;
+        const closeIdx = sql.indexOf(tag, i);
+        if (closeIdx !== -1) {
+          current += sql.slice(i, closeIdx + tag.length);
+          i = closeIdx + tag.length;
+        } else {
+          current += sql.slice(i);
+          i = len;
+        }
+        continue;
+      }
+    }
+
+    if (ch === '-' && next === '-') {
+      i += 2;
+      while (i < len && sql[i] !== '\n') i++;
+      current += ' ';
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      i += 2;
+      let depth = 1;
+      while (i < len && depth > 0) {
+        if (sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sql[i] === '*' && i + 1 < len && sql[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      current += ' ';
+      continue;
+    }
+
+    if (ch === ';') {
+      const trimmed = current.trim();
+      if (trimmed.length > 0) {
+        statements.push(trimmed);
+      }
+      current = '';
+      i++;
+      continue;
+    }
+
+    current += ch;
+    i++;
+  }
+
+  const trimmed = current.trim();
+  if (trimmed.length > 0) {
+    statements.push(trimmed);
+  }
+
+  return statements;
+}
+
+/**
  * Fail-Closed Production SQL Policy Validator (F14.5 Revision 20.4).
  * 1. Rejects empty, whitespace-only, or non-string SQL statements.
  * 2. Rejects multiple SQL statements (semicolon followed by non-whitespace statements).
@@ -367,20 +611,18 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     throw new Error('CRITICAL_BOUNDARY_ERROR: Empty or non-string SQL submitted to production database boundary');
   }
 
-  // Normalize comments and string literals
-  const cleanSql = sql
-    .replace(/\/\*[\s\S]*?\*\/|--.*$/gm, ' ')
-    .replace(/'(?:''|[^'])*'/g, "''")
-    .trim();
-
-  // 1. Multiple statement rejection:
-  const statements = cleanSql.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
+  // 1. Multiple statement rejection using PostgreSQL-aware tokenizer (F14.5 Revision 20.8)
+  const statements = splitSqlStatements(sql);
   if (statements.length > 1) {
     throw new Error('CRITICAL_BOUNDARY_ERROR: Multiple SQL statements forbidden through boundary');
   }
 
-  const singleStmt = statements[0] || cleanSql;
-  const upper = singleStmt.toUpperCase();
+  const singleStmt = statements[0] || sql.trim();
+  const normalizedRawSql = tokenizeAndStripSqlComments(singleStmt);
+
+  // Normalize string literals for relation and administrative keyword inspection
+  const cleanSql = normalizedRawSql.replace(/'(?:''|[^'])*'/g, "''").trim();
+  const upper = cleanSql.toUpperCase();
 
   // 2. Reject destructive administrative and unsupported mutation commands:
   if (/^(DROP|TRUNCATE|ALTER|GRANT|REVOKE|MERGE|COPY|CREATE|EXECUTE|PREPARE|DELETE|CALL|DO|VACUUM|ANALYZE|REINDEX|EXPLAIN)\b/.test(upper)) {
@@ -495,11 +737,11 @@ export function assertProductionSqlPolicy(sql: string, values?: any[]): void {
     validateTargetRelation(fullIdent);
   }
 
-  // 7. Canonical Reviewed SQL Template Catalog Enforcement (F14.5 Revision 20.7)
+  // 7. Canonical Reviewed SQL Template Catalog Enforcement (F14.5 Revision 20.7 & 20.8)
   // Rejects any SQL statement that does not match one of the audited canonical query templates
   // approved for production outbox processing.
   // Segregates production operational templates from non-production harness/diagnostic templates.
-  const normalizedRawSql = sql.replace(/\/\*[\s\S]*?\*\/|--.*$/gm, ' ').replace(/\s+/g, ' ').trim();
+  // Uses PostgreSQL-aware normalizedRawSql (comments stripped outside literals/identifiers).
   const isProd = isProductionRuntime();
 
   let matchedTemplate = PRODUCTION_SQL_TEMPLATES.find((t) => t.pattern.test(normalizedRawSql));
@@ -737,10 +979,19 @@ export class ProductionDatabaseBoundaryPoolAdapter {
 
   async #ensureConnectionInitialized(rawClient: any): Promise<void> {
     if (!rawClient || typeof rawClient.query !== 'function') {
+      if (rawClient) {
+        if (typeof rawClient.release === 'function') {
+          try { rawClient.release(); } catch {}
+        } else if (typeof rawClient.destroy === 'function') {
+          try { rawClient.destroy(); } catch {}
+        }
+      }
       throw new Error('CRITICAL_BOUNDARY_ERROR: Acquired connection client does not implement query() interface');
     }
-    if (initializedPhysicalClients.has(rawClient)) return;
 
+    // Unconditionally await session search_path pinning on EVERY acquisition (F14.5 Revision 20.8).
+    // Guarantees that regardless of connection reuse across pooled clients, every checked-out client
+    // is pinned to 'public, pg_temp' prior to executing application queries.
     try {
       await rawClient.query('SET search_path = public, pg_temp');
       initializedPhysicalClients.add(rawClient);
