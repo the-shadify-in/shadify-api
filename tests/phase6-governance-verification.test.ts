@@ -3754,6 +3754,32 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
             strictRevocationMode: true,
           });
         }).toThrow(/CRITICAL_CONFIG_ERROR: Pre-wrapped adapter cannot be overridden/);
+
+        // 11. Regression Test (F14.5-A): Adapter created in non-production with custom interceptor
+        // CANNOT bypass mandatory production policy when environment is switched to production
+        delete process.env.NODE_ENV; // Switch to non-production dev
+        const devProcessor = createProductionOutboxProcessor({
+          pool: rawFakePool,
+          interceptor: () => {}, // caller-supplied noop in dev
+          doCoordinator: { revokePhoto: async () => {} } as any,
+          strictRevocationMode: false,
+        });
+
+        // Switch back to production
+        process.env.NODE_ENV = 'production';
+        // Permanent policy chaining guarantees destructive and forbidden SQL is rejected:
+        await expect(async () => {
+          await devProcessor.pool.query('DROP TABLE outbox_events');
+        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Destructive administrative or unsupported SQL forbidden/);
+
+        await expect(async () => {
+          await devProcessor.pool.query('UPDATE photos SET status = 1');
+        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
+
+        const devClient = await devProcessor.pool.connect();
+        await expect(async () => {
+          await devClient.query("UPDATE private.photos SET status = 'x'");
+        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: photos table reference strictly forbidden/);
       } finally {
         process.env.NODE_ENV = oldEnv;
       }
@@ -3827,6 +3853,25 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       await expect(client3.query('SELECT 1 FROM outbox_events')).rejects.toThrow(
         /CRITICAL_BOUNDARY_ERROR: Cannot query on destroyed connection client/
       );
+
+      // 7. When rawClient.release(err) itself throws during rollback failure cleanup,
+      // the primary rollback error is preserved and the client remains marked permanently destroyed
+      const mockBrokenRawClient = {
+        query: vi.fn().mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(new Error('PRIMARY_ROLLBACK_FAILURE')),
+        release: vi.fn().mockImplementation(() => {
+          throw new Error('SECONDARY_SOCKET_RELEASE_EXCEPTION');
+        }),
+      };
+      const mockBrokenPool = { connect: async () => mockBrokenRawClient, query: vi.fn() };
+      const brokenAdapter = new ProductionDatabaseBoundaryPoolAdapter(mockBrokenPool, () => {});
+      const client4 = await brokenAdapter.connect();
+      await client4.query('BEGIN');
+
+      await expect(client4.release()).rejects.toThrow(
+        /CRITICAL_CLEANUP_FAILURE: Database rollback failed during release, connection destroyed: PRIMARY_ROLLBACK_FAILURE/
+      );
+      expect(client4.isDiscarded()).toBe(true);
+      expect(client4.getRollbackError()?.message).toBe('PRIMARY_ROLLBACK_FAILURE');
     });
 
     it('F15.5 Production Worker Error Handling: processBatch propagates combined error on rollback failure and preserves processing error across cleanup', async () => {

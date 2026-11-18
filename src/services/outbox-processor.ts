@@ -449,7 +449,11 @@ export class ProductionDatabaseBoundaryPoolAdapter {
       throw new Error('CRITICAL_BOUNDARY_ERROR: QueryInterceptorHook is mandatory for ProductionDatabaseBoundaryPoolAdapter');
     }
     this.#rawPool = rawPool;
-    this.#onQuery = onQuery;
+    // Policy inseparability: assertProductionSqlPolicy is permanently bound to this adapter
+    this.#onQuery = async (source, sql, values) => {
+      assertProductionSqlPolicy(sql, values);
+      await onQuery(source, sql, values);
+    };
     if (internalCreationToken === TRUSTED_PRODUCTION_ADAPTER_TOKEN) {
       trustedProductionAdapters.add(this);
     }
@@ -504,23 +508,22 @@ export function createProductionOutboxProcessor(options?: {
     }
   }
 
-  // Mandatory Production Boundary Adapter Enforcement (F14.5 Revision 20.3):
-  // 1. In production runtimes, arbitrary no-op interceptors are strictly forbidden.
-  //    Any custom interceptor is chained with assertProductionSqlPolicy.
+  // Mandatory Production Boundary Adapter Enforcement (F14.5 Revision 20.4):
+  // 1. Mandatory Policy Inseparability: assertProductionSqlPolicy is ALWAYS chained,
+  //    regardless of environment, whenever an adapter is constructed through this factory.
+  //    A trusted adapter can NEVER be registered with a caller-controlled unvalidated interceptor.
   // 2. Pre-wrapped adapters are rejected in production if untrusted or attempting to override policy.
   // 3. Raw pools are wrapped with native ECMAScript runtime-private #rawPool storage and stamped with
   //    TRUSTED_PRODUCTION_ADAPTER_TOKEN so caller-created adapters cannot forge trust.
-  let effectiveInterceptor: QueryInterceptorHook = defaultProductionBoundaryInterceptor;
+  let effectiveInterceptor: QueryInterceptorHook;
   if (options?.interceptor) {
-    if (isProd) {
-      const customHook = options.interceptor;
-      effectiveInterceptor = async (source, sql, values) => {
-        assertProductionSqlPolicy(sql, values);
-        await customHook(source, sql, values);
-      };
-    } else {
-      effectiveInterceptor = options.interceptor;
-    }
+    const customHook = options.interceptor;
+    effectiveInterceptor = async (source, sql, values) => {
+      assertProductionSqlPolicy(sql, values);
+      await customHook(source, sql, values);
+    };
+  } else {
+    effectiveInterceptor = defaultProductionBoundaryInterceptor;
   }
 
   let poolToUse: any = options?.pool || dbPool;
