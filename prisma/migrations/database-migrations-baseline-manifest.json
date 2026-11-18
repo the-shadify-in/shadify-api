@@ -1,0 +1,68 @@
+{
+  "manifest_version": "1.0.0",
+  "created_at": "2026-11-15T18:10:00Z",
+  "description": "Authoritative pinned baseline manifest for PostgreSQL database migrations",
+  "provenance": {
+    "source_repository": "shadify",
+    "audit_phase": "Phase 6 Follow-Up",
+    "governance_order": "Order 4 STRICT HOLD",
+    "anchors": {
+      "shadify_api_baseline_commit": "6cc9348320514336b90b530963e6c87d17530dcc",
+      "shadify_api_baseline_subject": "chore: clean working tree",
+      "shadify_app_baseline_commit": "186042c2158adb9f0fdb9c299f895d4fb032f7f0",
+      "shadify_app_baseline_subject": "docs(security): track security verification pack with DB-001 audit and DB-003 two-session concurrency suite"
+    }
+  },
+  "shadify_app_migrations": {
+    "0_init/migration.sql": {
+      "sha256": "76ef87410f0ef0e05d1d6cd7f61d2afe2c0e3cb440d41e4bdfbb2d3ad66c588a",
+      "bytes": 16786
+    },
+    "1_db_protections/migration.sql": {
+      "sha256": "f6467c3d87c3900d3d2e267e048efc314affc30f97096c253a17a60b716b814b",
+      "bytes": 3057
+    },
+    "2_theme_config/migration.sql": {
+      "sha256": "fd8568c68df703e181e90709a54fb041dc91e35bef3152bf0baefdf108deb5c6",
+      "bytes": 422
+    },
+    "3_promos_and_referrals/migration.sql": {
+      "sha256": "d9f3123f4b7278c923b75b1e136185c62da345c11590209d2f5322efa4ca6f0d",
+      "bytes": 2115
+    },
+    "4_reserved_slugs_expand/migration.sql": {
+      "sha256": "7543e24f9662a0447a0271b28cd24c5cd5a73dc6aefd398c77d1a6601fd73d2f",
+      "bytes": 1646
+    },
+    "5_schema_constraints_alignment/migration.sql": {
+      "sha256": "d95a3eafdb6e5413b46c6df4c2c95facf947986844c5b15b1793224fd2f64c16",
+      "bytes": 1075
+    },
+    "6_chip_counts/migration.sql": {
+      "sha256": "f93793efd38833c89ae6b8b02f6010778a3bd12f2c7f29f54470bf0573b1026a",
+      "bytes": 636
+    },
+    "7_aliases_and_qr_assets/migration.sql": {
+      "sha256": "36e21f91ba47ef70356895db91953c44576f4e716f6f4eaf8dc56bffee26e67a",
+      "bytes": 6333
+    }
+  },
+  "shadify_api_migrations": {
+    "20261110_000_bootstrap_migration_ledger/migration.sql": {
+      "sha256": "f8095fb7020c54bd0b0a55d10d49e79e1c745dd3e6e711eebe1c1901e45458dd",
+      "bytes": 4107
+    },
+    "20261110_001_create_outbox_events/migration.sql": {
+      "sha256": "5ffa19ee1f6fcfbcabcabfc2f9481ac8f3a1079de0a67963e8ec97715f23c232",
+      "bytes": 1162
+    },
+    "20261115_002_security_fencing_and_revocation_ledger/migration.sql": {
+      "sha256": "001e7f282b23c19fb61ed078b82333048739063bb1ac1ad251225c40dea15964",
+      "bytes": 12502
+    },
+    "20261115_003_audit_log_and_role_grants/migration.sql": {
+      "sha256": "6e80bb283f5671ea5784a627fd4b43a2b11bf8f3a44a89ad8903ec3ecb3a8db4",
+      "bytes": 7618
+    }
+  }
+}

@@ -1,6 +1,5 @@
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -362,8 +361,10 @@ model Photo {
   uploadedAt       DateTime        @default(now()) @map("uploaded_at") @db.Timestamptz(6)
   rejectedPurgeAt      DateTime?       @map("rejected_purge_at") @db.Timestamptz(6)
   processingGeneration BigInt          @default(1) @map("processing_generation")
+  uploadSessionId      BigInt?         @unique(map: "uq_photos_session") @map("upload_session_id")
 
   wedding          Wedding         @relation("WeddingPhotos", fields: [weddingId], references: [id], onDelete: Cascade)
+  uploadSession    UploadSession?  @relation(fields: [uploadSessionId], references: [id], onDelete: NoAction)
   event            Event?          @relation(fields: [eventId], references: [id], onDelete: SetNull)
   uploader         User?           @relation("PhotoUploader", fields: [uploadedBy], references: [id], onDelete: SetNull)
   heroForWeddings  Wedding[]       @relation("WeddingHeroPhoto")
@@ -522,18 +523,31 @@ model ErasureRequest {
   @@map("erasure_requests")
 }
 
-model AuditLog {
-  id        BigInt   @id @default(autoincrement())
-  weddingId String?  @map("wedding_id") @db.Uuid
-  actorId   String?  @map("actor_id") @db.Uuid
-  action    String
-  detail    Json?
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+model OperatorIdentity {
+  id                String     @id @db.Uuid
+  operatorUserId    String     @unique @map("operator_user_id")
+  authoritativeRole String     @map("authoritative_role")
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  auditLogs         AuditLog[]
 
-  wedding   Wedding? @relation(fields: [weddingId], references: [id], onDelete: SetNull)
-  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  @@map("operator_identities")
+}
+
+model AuditLog {
+  id         BigInt            @id @default(autoincrement())
+  weddingId  String?           @map("wedding_id") @db.Uuid
+  actorId    String?           @map("actor_id") @db.Uuid
+  operatorId String?           @map("operator_id") @db.Uuid
+  action     String
+  detail     Json?
+  createdAt  DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  wedding    Wedding?          @relation(fields: [weddingId], references: [id], onDelete: SetNull)
+  actor      User?             @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  operator   OperatorIdentity? @relation(fields: [operatorId], references: [id], onDelete: Restrict)
 
   @@index([weddingId, createdAt(sort: Desc)], map: "idx_audit_wedding")
+  @@index([operatorId], map: "idx_audit_operator")
   @@map("audit_log")
 }
 
@@ -677,21 +691,26 @@ model QrScanTest {
 // ---------------------------------------------------------------------
 
 model UploadSession {
-  id                  BigInt    @id @default(autoincrement())
-  weddingId           String    @map("wedding_id") @db.Uuid
-  expectedBytes       BigInt    @map("expected_bytes")
-  actualBytes         BigInt?   @map("actual_bytes")
-  bucketName          String    @default("shadify-photos") @map("bucket_name") @db.VarChar(63)
-  objectKey           String    @map("object_key")
-  isMultipart         Boolean   @default(false) @map("is_multipart")
-  multipartUploadId   String?   @map("multipart_upload_id")
-  status              String    @default("RESERVED") @db.VarChar(32)
-  idempotencyKey      String?   @map("idempotency_key") @db.VarChar(64)
-  requestFingerprint  String?   @map("request_fingerprint") @db.VarChar(64)
-  expiresAt           DateTime  @map("expires_at") @db.Timestamptz(6)
-  completedAt         DateTime? @map("completed_at") @db.Timestamptz(6)
-  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt           DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  id                         BigInt    @id @default(autoincrement())
+  weddingId                  String    @map("wedding_id") @db.Uuid
+  expectedBytes              BigInt    @map("expected_bytes")
+  actualBytes                BigInt?   @map("actual_bytes")
+  bucketName                 String    @default("shadify-photos") @map("bucket_name") @db.VarChar(63)
+  objectKey                  String    @map("object_key")
+  isMultipart                Boolean   @default(false) @map("is_multipart")
+  multipartUploadId          String?   @map("multipart_upload_id")
+  status                     String    @default("RESERVED") @db.VarChar(32)
+  idempotencyKey             String?   @map("idempotency_key") @db.VarChar(64)
+  requestFingerprint         String?   @map("request_fingerprint") @db.VarChar(64)
+  expiresAt                  DateTime  @map("expires_at") @db.Timestamptz(6)
+  completedAt                DateTime? @map("completed_at") @db.Timestamptz(6)
+  verificationGeneration     Int       @default(0) @map("verification_generation")
+  verificationLeaseToken     String?   @map("verification_lease_token")
+  verificationLeaseExpiresAt DateTime? @map("verification_lease_expires_at") @db.Timestamptz(6)
+  createdAt                  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                  DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  photo                      Photo?
 
   @@index([status, expiresAt], map: "idx_upload_sessions_status_expires")
   @@index([weddingId, status, id], map: "idx_upload_sessions_wedding_status_id")
@@ -761,4 +780,54 @@ model AdminUser {
   updatedAt     DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("admin_users")
+}
+
+// ---------------------------------------------------------------------
+// Security Fencing, Replay Prevention & Revocation Models (F06, F08, F13)
+// ---------------------------------------------------------------------
+
+model DelegationJtiRegistry {
+  jti       String   @id @db.Uuid
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([expiresAt], map: "idx_delegation_jti_expires_at")
+  @@map("delegation_jti_registry")
+}
+
+model RevokedDelegationKey {
+  keyId     String   @id @map("key_id")
+  revokedAt DateTime @default(now()) @map("revoked_at") @db.Timestamptz(6)
+  reason    String
+
+  @@map("revoked_delegation_keys")
+}
+
+model RevokedOperator {
+  operatorId String   @id @map("operator_id") @db.Uuid
+  revokedAt  DateTime @default(now()) @map("revoked_at") @db.Timestamptz(6)
+  reason     String
+
+  @@map("revoked_operators")
+}
+
+model GuestPinAttempt {
+  weddingSlug    String    @map("wedding_slug")
+  ipAddress      String    @map("ip_address")
+  failedAttempts Int       @default(0) @map("failed_attempts")
+  lockedUntil    DateTime? @map("locked_until") @db.Timestamptz(6)
+  windowStart    DateTime  @default(now()) @map("window_start") @db.Timestamptz(6)
+
+  @@id([weddingSlug, ipAddress])
+  @@index([weddingSlug, windowStart], map: "idx_guest_pin_attempts_wedding")
+  @@map("guest_pin_attempts")
+}
+
+model RevokedGuestToken {
+  tokenHash String   @id @map("token_hash")
+  revokedAt DateTime @default(now()) @map("revoked_at") @db.Timestamptz(6)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+
+  @@index([expiresAt], map: "idx_revoked_guest_tokens_expires")
+  @@map("revoked_guest_tokens")
 }

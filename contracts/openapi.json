@@ -1,0 +1,674 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Shadify Central API",
+    "version": "1.1.0-draft",
+    "description": "Central domain, quota, storage, and authentication authority for Shadify client ecosystem."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local Development / Mock Gateway"
+    },
+    {
+      "url": "https://api.shadify.in",
+      "description": "Production Central API Origin (Behind Cloudflare Edge)"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "API is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Readiness probe",
+        "operationId": "getReadiness",
+        "responses": {
+          "200": {
+            "description": "Database pool is connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Database pool is disconnected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/uploads/reserve": {
+      "post": {
+        "summary": "Reserve storage quota and initialize upload",
+        "operationId": "reserveUpload",
+        "security": [{ "EdgeHmac": [] }, { "PhotographerSession": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReserveUploadRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Quota reserved and session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReserveUploadResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/400BadRequest" },
+          "401": { "$ref": "#/components/responses/401Unauthorized" },
+          "403": { "$ref": "#/components/responses/403QuotaExceeded" }
+        }
+      }
+    },
+    "/v1/uploads/{id}/part-url": {
+      "post": {
+        "summary": "Generate presigned multipart part URL",
+        "operationId": "getUploadPartUrl",
+        "security": [{ "EdgeHmac": [] }, { "PhotographerSession": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadPartUrlRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Presigned part URL generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadPartUrlResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/400BadRequest" },
+          "401": { "$ref": "#/components/responses/401Unauthorized" },
+          "404": { "$ref": "#/components/responses/404NotFound" }
+        }
+      }
+    },
+    "/v1/uploads/{id}/complete": {
+      "post": {
+        "summary": "Complete single or multipart upload session",
+        "operationId": "completeUpload",
+        "security": [{ "EdgeHmac": [] }, { "PhotographerSession": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteUploadRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upload session completed and photo committed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompleteUploadResponse"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/400BadRequest" },
+          "401": { "$ref": "#/components/responses/401Unauthorized" }
+        }
+      }
+    },
+    "/v1/uploads/{id}/abort": {
+      "post": {
+        "summary": "Abort and clean up upload session",
+        "operationId": "abortUpload",
+        "security": [{ "EdgeHmac": [] }, { "PhotographerSession": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload session cancelled and quota released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AbortUploadResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/uploads/{id}/status": {
+      "get": {
+        "summary": "Query upload session status",
+        "operationId": "getUploadStatus",
+        "security": [{ "EdgeHmac": [] }, { "PhotographerSession": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload status details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/weddings/{slug}": {
+      "get": {
+        "summary": "Get wedding public metadata",
+        "operationId": "getWeddingMetadata",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Wedding public metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeddingMetadataResponse"
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/404NotFound" }
+        }
+      }
+    },
+    "/v1/weddings/{slug}/verify-pin": {
+      "post": {
+        "summary": "Verify wedding access PIN",
+        "operationId": "verifyWeddingPin",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyPinRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PIN successfully verified and session token issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyPinResponse"
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/401Unauthorized" },
+          "429": { "$ref": "#/components/responses/429TooManyRequests" }
+        }
+      }
+    },
+    "/v1/weddings/{slug}/gallery": {
+      "get": {
+        "summary": "Get paginated gallery photos",
+        "operationId": "getWeddingGallery",
+        "security": [{ "GuestPinToken": [] }, {}],
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 100 }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "eventId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated gallery feed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GalleryFeedResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal-bff/weddings": {
+      "get": {
+        "summary": "List provisioned weddings for admin dashboard",
+        "operationId": "listAdminWeddings",
+        "security": [{ "GcpOidcBearer": [] }],
+        "responses": {
+          "200": {
+            "description": "List of weddings with storage statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminWeddingsListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal-bff/maintenance/clean-expired-sessions": {
+      "post": {
+        "summary": "Clean expired upload sessions",
+        "operationId": "cleanExpiredSessions",
+        "security": [{ "GcpOidcBearer": [] }],
+        "responses": {
+          "200": {
+            "description": "Expired sessions cleaned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanExpiredSessionsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "EdgeHmac": {
+        "type": "apiKey",
+        "name": "x-shadify-signature",
+        "in": "header",
+        "description": "Cloudflare Worker Origin HMAC-SHA256 signature"
+      },
+      "PhotographerSession": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Photographer desktop session token"
+      },
+      "GuestPinToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Guest PIN-verified session token"
+      },
+      "GcpOidcBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Google Cloud OIDC ID token for service-to-service auth"
+      }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status", "timestamp", "service"],
+        "properties": {
+          "status": { "type": "string", "example": "UP" },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "service": { "type": "string", "example": "shadify-api" }
+        }
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "required": ["status", "database"],
+        "properties": {
+          "status": { "type": "string", "example": "READY" },
+          "database": { "type": "string", "example": "CONNECTED" }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": ["statusCode", "error", "code", "message", "timestamp"],
+        "properties": {
+          "statusCode": { "type": "integer" },
+          "error": { "type": "string" },
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "requestId": { "type": "string" },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "details": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "ReserveUploadRequest": {
+        "type": "object",
+        "required": ["weddingId", "expectedBytes", "contentType"],
+        "properties": {
+          "weddingId": { "type": "string", "format": "uuid" },
+          "expectedBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "contentType": { "type": "string" },
+          "isMultipart": { "type": "boolean", "default": false },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "idempotencyKey": { "type": "string" }
+        }
+      },
+      "ReserveUploadResponse": {
+        "type": "object",
+        "required": ["sessionId", "weddingId", "objectKey", "status", "isMultipart", "expiresAt"],
+        "properties": {
+          "sessionId": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "weddingId": { "type": "string", "format": "uuid" },
+          "objectKey": { "type": "string" },
+          "status": { "type": "string", "enum": ["RESERVED", "UPLOADING", "COMPLETED", "CANCELLED", "EXPIRED"] },
+          "isMultipart": { "type": "boolean" },
+          "uploadUrl": { "type": "string", "nullable": true },
+          "multipartUploadId": { "type": "string", "nullable": true },
+          "partSizeMinBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UploadPartUrlRequest": {
+        "type": "object",
+        "required": ["partNumber"],
+        "properties": {
+          "partNumber": { "type": "integer", "minimum": 1, "maximum": 10000 }
+        }
+      },
+      "UploadPartUrlResponse": {
+        "type": "object",
+        "required": ["sessionId", "partNumber", "uploadUrl", "expiresAt"],
+        "properties": {
+          "sessionId": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "partNumber": { "type": "integer" },
+          "uploadUrl": { "type": "string" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UploadPartManifest": {
+        "type": "object",
+        "required": ["partNumber", "etag"],
+        "properties": {
+          "partNumber": { "type": "integer", "minimum": 1, "maximum": 10000 },
+          "etag": { "type": "string" }
+        }
+      },
+      "CompleteUploadRequest": {
+        "type": "object",
+        "required": ["actualBytes"],
+        "properties": {
+          "actualBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "parts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/UploadPartManifest" }
+          }
+        }
+      },
+      "CompleteUploadResponse": {
+        "type": "object",
+        "required": ["status", "photoId", "weddingId", "actualBytes", "completedAt"],
+        "properties": {
+          "status": { "type": "string", "enum": ["COMPLETED"] },
+          "photoId": { "type": "string", "format": "uuid" },
+          "weddingId": { "type": "string", "format": "uuid" },
+          "actualBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "completedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AbortUploadResponse": {
+        "type": "object",
+        "required": ["sessionId", "status", "abortedAt"],
+        "properties": {
+          "sessionId": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "status": { "type": "string", "enum": ["CANCELLED"] },
+          "abortedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UploadStatusResponse": {
+        "type": "object",
+        "required": ["sessionId", "weddingId", "status", "expectedBytes", "isMultipart", "expiresAt"],
+        "properties": {
+          "sessionId": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "weddingId": { "type": "string", "format": "uuid" },
+          "status": { "type": "string", "enum": ["RESERVED", "UPLOADING", "COMPLETING", "COMPLETED", "CANCELLED", "EXPIRED"] },
+          "expectedBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "actualBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$", "nullable": true },
+          "isMultipart": { "type": "boolean" },
+          "expiresAt": { "type": "string", "format": "date-time" },
+          "completedAt": { "type": "string", "format": "date-time", "nullable": true }
+        }
+      },
+      "WeddingMetadataResponse": {
+        "type": "object",
+        "required": ["id", "slug", "brideName", "groomName", "weddingDate", "status", "hasPinProtection"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "slug": { "type": "string" },
+          "brideName": { "type": "string" },
+          "groomName": { "type": "string" },
+          "weddingDate": { "type": "string" },
+          "status": { "type": "string", "enum": ["draft", "preview", "published", "archived", "expired"] },
+          "hasPinProtection": { "type": "boolean" },
+          "themeId": { "type": "string" },
+          "primaryColor": { "type": "string", "nullable": true },
+          "accentColor": { "type": "string", "nullable": true },
+          "heroPhotoUrl": { "type": "string", "nullable": true }
+        }
+      },
+      "VerifyPinRequest": {
+        "type": "object",
+        "required": ["pin"],
+        "properties": {
+          "pin": { "type": "string", "minLength": 4, "maxLength": 12, "pattern": "^[a-zA-Z0-9_-]+$" }
+        }
+      },
+      "VerifyPinResponse": {
+        "type": "object",
+        "required": ["token", "weddingSlug", "expiresAt"],
+        "properties": {
+          "token": { "type": "string" },
+          "weddingSlug": { "type": "string" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PhotoFeedItem": {
+        "type": "object",
+        "required": ["id", "weddingId", "thumbnailUrl", "previewUrl", "width", "height", "isHighlight", "uploadedAt"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "weddingId": { "type": "string", "format": "uuid" },
+          "eventId": { "type": "string", "format": "uuid", "nullable": true },
+          "thumbnailUrl": { "type": "string" },
+          "previewUrl": { "type": "string" },
+          "width": { "type": "integer" },
+          "height": { "type": "integer" },
+          "isHighlight": { "type": "boolean" },
+          "takenAt": { "type": "string", "format": "date-time", "nullable": true },
+          "uploadedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "GalleryFeedResponse": {
+        "type": "object",
+        "required": ["items", "hasMore"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PhotoFeedItem" }
+          },
+          "nextCursor": { "type": "string", "nullable": true },
+          "hasMore": { "type": "boolean" }
+        }
+      },
+      "AdminWeddingSummary": {
+        "type": "object",
+        "required": ["id", "slug", "brideName", "groomName", "plan", "status", "usedBytes", "quotaBytes", "photoCount"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "slug": { "type": "string" },
+          "brideName": { "type": "string" },
+          "groomName": { "type": "string" },
+          "plan": { "type": "string", "enum": ["lite", "premium", "platinum"] },
+          "status": { "type": "string", "enum": ["draft", "preview", "published", "archived", "expired"] },
+          "usedBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "quotaBytes": { "type": "string", "pattern": "^(0|[1-9]\\d*)$" },
+          "photoCount": { "type": "integer" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AdminWeddingsListResponse": {
+        "type": "object",
+        "required": ["weddings"],
+        "properties": {
+          "weddings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AdminWeddingSummary" }
+          }
+        }
+      },
+      "CleanExpiredSessionsResponse": {
+        "type": "object",
+        "required": ["status", "cleanedCount"],
+        "properties": {
+          "status": { "type": "string", "example": "SUCCESS" },
+          "cleanedCount": { "type": "integer", "example": 0 }
+        }
+      }
+    },
+    "responses": {
+      "400BadRequest": {
+        "description": "Validation failed",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "401Unauthorized": {
+        "description": "Missing or invalid credentials",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "403QuotaExceeded": {
+        "description": "Storage or photo count quota exceeded",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "404NotFound": {
+        "description": "Requested resource not found",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      },
+      "429TooManyRequests": {
+        "description": "Rate limit threshold reached",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      }
+    }
+  }
+}
+

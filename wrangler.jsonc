@@ -1,0 +1,58 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "shadify-edge-media-cdn",
+  "main": "src/worker/edge-cdn-handler.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    {
+      "binding": "WEDDING_REVOCATION_KV",
+      "id": "c1f7823901b0460cbbce910f54e1982b",
+      "preview_id": "a90184b2e1774889b70d554a9f99201a"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WEDDING_REVOCATION_DO",
+        "class_name": "WeddingRevocationCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["WeddingRevocationCoordinator"]
+    }
+  ],
+  "vars": {
+    "STRICT_REVOCATION_MODE": true,
+    "ALLOW_EVENTUAL_CONSISTENCY": false
+  },
+  "env": {
+    "production": {
+      "name": "shadify-edge-media-cdn-prod",
+      "vars": {
+        "ENVIRONMENT": "production",
+        "NODE_ENV": "production",
+        "STRICT_REVOCATION_MODE": true,
+        "ALLOW_EVENTUAL_CONSISTENCY": false
+      },
+      "kv_namespaces": [
+        {
+          "binding": "WEDDING_REVOCATION_KV",
+          "id": "c1f7823901b0460cbbce910f54e1982b"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "WEDDING_REVOCATION_DO",
+            "class_name": "WeddingRevocationCoordinator"
+          }
+        ]
+      }
+    }
+  }
+}
+
