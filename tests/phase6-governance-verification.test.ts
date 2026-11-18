@@ -24,6 +24,7 @@ import {
   containsPhotosTableReference,
   ProductionDatabaseBoundaryPoolAdapter,
   isTrustedProductionAdapter,
+  assertProductionSqlPolicy,
 } from '../src/services/outbox-processor.js';
 import {
   EdgeCdnHandler,
@@ -3244,6 +3245,10 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
         public rawDriverCount = 0;
 
         async executeRaw(source: 'client.query' | 'pool.query', sql: string, values?: any[]): Promise<any> {
+          if (sql.startsWith('SET search_path')) {
+            // Internal socket connection initialization executed by ProductionDatabaseBoundaryPoolAdapter
+            return { rows: [] };
+          }
           this.rawDriverCount++;
           if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
             return { rows: [] };
@@ -3832,7 +3837,9 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: SQL statement does not match any approved canonical production template in catalog \(T1-T13\)/);
 
       // Proof: Rejected queries NEVER reached raw driver!
-      expect(rawQueryMock).not.toHaveBeenCalled();
+      // The only query that reached rawQueryMock was the internal connection initialization query
+      expect(rawQueryMock).toHaveBeenCalledTimes(1);
+      expect(rawQueryMock).toHaveBeenCalledWith('SET search_path = public, pg_temp');
 
       // 7. Legitimate outbox operations pass cleanly through the boundary
       await defaultProcessor.pool.query('BEGIN');
@@ -3840,7 +3847,7 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       await defaultProcessor.pool.query('UPDATE outbox_events SET status = $1 WHERE id = $2', ['PROCESSING', 1]);
       await defaultProcessor.pool.query('INSERT INTO audit_log (id, event_type) VALUES ($1, $2)', ['a1', 'REVOKE']);
       await defaultProcessor.pool.query('COMMIT');
-      expect(rawQueryMock).toHaveBeenCalledTimes(5);
+      expect(rawQueryMock).toHaveBeenCalledTimes(6); // 1 connection init + 5 operations
 
       // 8. In production runtime, passing a no-op interceptor CANNOT bypass SQL policy
       const oldEnv = process.env.NODE_ENV;
@@ -3914,43 +3921,98 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       }
     });
 
-    it('F14.5-B Real PostgreSQL Integration: proves initialized connection has awaited search_path = public, pg_temp and resolves unqualified outbox_events to public before worker queries execute', async () => {
+    it('F14.5-B Production Template Isolation Negative Test: rejects harness-only templates in production runtime', async () => {
+      const oldEnv = process.env.NODE_ENV;
+      try {
+        process.env.NODE_ENV = 'production';
+        // T-HARNESS-3: UPDATE outbox_events SET status = $1 WHERE id = $2 (permitted in dev/test, rejected in prod)
+        expect(() => {
+          assertProductionSqlPolicy('UPDATE outbox_events SET status = $1 WHERE id = $2', ['PROCESSING', 1]);
+        }).toThrow(/CRITICAL_BOUNDARY_ERROR: Harness\/test SQL template is strictly forbidden in production runtime/);
+
+        // T-HARNESS-2: SELECT 1 FROM audit_log WHERE id = 1
+        expect(() => {
+          assertProductionSqlPolicy('SELECT 1 FROM audit_log WHERE id = 1');
+        }).toThrow(/CRITICAL_BOUNDARY_ERROR: Harness\/test SQL template is strictly forbidden in production runtime/);
+
+        // T-HARNESS-4: INSERT INTO audit_log (id, event_type) VALUES ($1, $2)
+        expect(() => {
+          assertProductionSqlPolicy('INSERT INTO audit_log (id, event_type) VALUES ($1, $2)', ['a1', 'REVOKE']);
+        }).toThrow(/CRITICAL_BOUNDARY_ERROR: Harness\/test SQL template is strictly forbidden in production runtime/);
+
+        // Completely unapproved SQL template
+        expect(() => {
+          assertProductionSqlPolicy('SELECT id, payload FROM outbox_events WHERE 1=1');
+        }).toThrow(/CRITICAL_BOUNDARY_ERROR: SQL statement does not match any approved canonical production template in catalog \(T1-T13\)/);
+      } finally {
+        process.env.NODE_ENV = oldEnv;
+      }
+    });
+
+    it('F14.5-B Real PostgreSQL Integration: proves initialized connection has awaited search_path = public, pg_temp, temporary relation shadowing is neutralized, and resolves unqualified outbox_events strictly to public', async () => {
       const rawPool = new pg.Pool(localDbConfig);
       let rawClient: pg.PoolClient | undefined;
       try {
         rawClient = await rawPool.connect();
       } catch (err: any) {
-        if (err.code === 'EPERM' || err.message?.includes('EPERM')) {
-          console.warn('Skipping F14.5-B live PostgreSQL integration test: loopback 5433 blocked by sandbox');
-          await rawPool.end().catch(() => {});
-          return;
-        }
-        throw err;
+        await rawPool.end().catch(() => {});
+        // Live integration test failure cannot silently skip: must report as verification failure
+        throw new Error(
+          `CRITICAL_RELEASE_GATE_VERIFICATION_FAILURE: Live PostgreSQL on port 5433 required for F14.5-B security verification is unavailable: ${err.message}`
+        );
       }
-      rawClient.release();
-
-      const adapter = new ProductionDatabaseBoundaryPoolAdapter(rawPool, () => {});
-      const client = await adapter.connect();
 
       try {
-        // 1. Verify that BEFORE any worker query runs, the connection search_path is strictly public, pg_temp:
-        const settingRes = await client.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
-        expect(settingRes.rows[0].path).toBe('public, pg_temp');
+        // 1. Temporary Relation Shadowing Attack: Create a same-named temporary relation in this session
+        // BEFORE the boundary initializes the connection. In unpinned PostgreSQL, pg_temp precedes public:
+        await rawClient.query('CREATE TEMP TABLE outbox_events (id int, is_temp boolean)');
 
-        // 2. Verify that an unqualified query resolves strictly to public.outbox_events:
-        const probeRes = await client.query('SELECT 1 FROM outbox_events');
-        expect(probeRes).toBeDefined();
+        const singleConnPool = {
+          connect: async () => rawClient,
+          query: (sql: string, params?: any[]) => rawClient!.query(sql, params),
+        };
+        const adapter = new ProductionDatabaseBoundaryPoolAdapter(singleConnPool as any, () => {});
 
-        // 3. Verify that any attempt to alter or reset search_path through the boundary is strictly rejected:
-        await expect(async () => {
-          await client.query('SET search_path = evil, public');
-        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden/);
+        // 2. Awaited acquisition: adapter awaits 'SET search_path = public, pg_temp' before returning client:
+        const client = await adapter.connect();
 
-        await expect(async () => {
-          await client.query('RESET ALL');
-        }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path via RESET ALL is strictly forbidden/);
+        try {
+          // 3. Inspect PostgreSQL system catalog directly in this session to verify relation resolution:
+          const catalogRes = await rawClient.query(`
+            SELECT
+              'outbox_events'::regclass::oid AS resolved_oid,
+              'public.outbox_events'::regclass::oid AS public_oid,
+              'pg_temp.outbox_events'::regclass::oid AS temp_oid,
+              relnamespace::regnamespace::text AS resolved_schema
+            FROM pg_class
+            WHERE oid = 'outbox_events'::regclass::oid
+          `);
+          expect(catalogRes.rows[0].resolved_schema).toBe('public');
+          expect(catalogRes.rows[0].resolved_oid).toBe(catalogRes.rows[0].public_oid);
+          expect(catalogRes.rows[0].resolved_oid).not.toBe(catalogRes.rows[0].temp_oid);
+
+          // 4. Verify search_path setting through boundary:
+          const settingRes = await client.query("SELECT current_setting('search_path') AS path FROM outbox_events LIMIT 1");
+          expect(settingRes.rows[0].path).toBe('public, pg_temp');
+
+          // 5. Verify that unqualified query through boundary resolves strictly to public.outbox_events:
+          // Note: columns id and event_type exist on public.outbox_events, NOT on pg_temp.outbox_events (which only has id, is_temp)
+          const probeRes = await client.query("SELECT id, event_type FROM outbox_events WHERE status = $1", ['PENDING']);
+          expect(probeRes).toBeDefined();
+
+          // 6. Verify that boundary strictly forbids modifying search_path:
+          await expect(async () => {
+            await client.query('SET search_path = evil, public');
+          }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path is strictly forbidden/);
+
+          await expect(async () => {
+            await client.query('RESET ALL');
+          }).rejects.toThrow(/CRITICAL_BOUNDARY_ERROR: Modification of search_path via RESET ALL is strictly forbidden/);
+        } finally {
+          await rawClient.query('DROP TABLE IF EXISTS pg_temp.outbox_events').catch(() => {});
+          await client.release();
+        }
       } finally {
-        await client.release();
         await rawPool.end().catch(() => {});
       }
     });
@@ -4028,7 +4090,10 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       // the primary rollback error is preserved, destroy() is invoked as secondary fallback,
       // and the client remains marked permanently destroyed
       const mockBrokenRawClient = {
-        query: vi.fn().mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(new Error('PRIMARY_ROLLBACK_FAILURE')),
+        query: vi.fn().mockImplementation(async (sql: string) => {
+          if (sql === 'ROLLBACK') throw new Error('PRIMARY_ROLLBACK_FAILURE');
+          return { rows: [] };
+        }),
         release: vi.fn().mockImplementation(() => {
           throw new Error('SECONDARY_SOCKET_RELEASE_EXCEPTION');
         }),
@@ -4051,7 +4116,10 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
       // 8. When BOTH rawClient.release(err) and destroy() throw, socket destruction cannot be confirmed
       // and is accurately reported as unconfirmed without overstating the guarantee:
       const mockDoubleBrokenRawClient = {
-        query: vi.fn().mockResolvedValueOnce({ rows: [] }).mockRejectedValueOnce(new Error('PRIMARY_ROLLBACK_FAILURE')),
+        query: vi.fn().mockImplementation(async (sql: string) => {
+          if (sql === 'ROLLBACK') throw new Error('PRIMARY_ROLLBACK_FAILURE');
+          return { rows: [] };
+        }),
         release: vi.fn().mockImplementation(() => {
           throw new Error('SECONDARY_SOCKET_RELEASE_EXCEPTION');
         }),
@@ -4078,9 +4146,10 @@ describe('Phase 6 Definitive Governance Verification Suite (F14 & F15)', () => {
     it('F15.5 Direct Rollback-Query Failure & Exactly-Once Client Release: when client.query("ROLLBACK") fails inside query(), rawClient.release is called with rollback error immediately, and subsequent finally { await client.release() } does NOT double-release', async () => {
       const rollbackErr = new Error('SIMULATED_ROLLBACK_QUERY_FAILURE');
       const mockRawClient = {
-        query: vi.fn()
-          .mockResolvedValueOnce({ rows: [] }) // BEGIN
-          .mockRejectedValueOnce(rollbackErr), // ROLLBACK fails
+        query: vi.fn().mockImplementation(async (sql: string) => {
+          if (sql === 'ROLLBACK') throw rollbackErr;
+          return { rows: [] };
+        }),
         release: vi.fn(),
       };
       const mockPool = {
